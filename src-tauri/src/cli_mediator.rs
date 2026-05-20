@@ -89,6 +89,7 @@ impl CliMediator {
                     let mut cmd = Command::new(direct_path);
                     cmd.current_dir(&workspace_root)
                        .arg("--print")
+                       .arg("--dangerously-skip-permissions")
                        .stdin(Stdio::piped())
                        .stdout(Stdio::piped())
                        .stderr(Stdio::piped());
@@ -194,7 +195,7 @@ impl CliMediator {
                 
                 match final_model.as_str() {
                     "claude" => {
-                        cmd.args(&["claude", "--print"]);
+                        cmd.args(&["claude", "--print", "--dangerously-skip-permissions"]);
                     }
                     "grok" => {
                         let mut args = vec!["grok", "-c"];
@@ -255,7 +256,9 @@ impl CliMediator {
             }
 
             match final_model.as_str() {
-                "claude" => { cmd.arg("--print"); }
+                "claude" => {
+                    cmd.args(&["--print", "--dangerously-skip-permissions"]);
+                }
                 "grok" => {
                     let mut args = vec!["-c"];
                     if let Some(ref m) = specific_model {
