@@ -11,6 +11,7 @@ pub struct PromptRequest {
     pub model: String, // "claude", "gemini", "grok", "codex"
     pub prompt: String,
     pub agent_mappings: Option<HashMap<String, String>>,
+    pub provider_models: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +42,10 @@ impl CliMediator {
         let session_id = req.session_id.clone();
         
         let final_model = route_task(&req.prompt, &req.model, req.agent_mappings.as_ref());
+        let specific_model = req.provider_models.as_ref()
+            .and_then(|m| m.get(&final_model))
+            .cloned();
+            
         let cleaned_prompt = clean_prompt(&req.prompt);
         let prompt_with_harness = format!(
             "{}\n\n[SYSTEM INSTRUCTION]: You are running in the nTropy workspace environment. You have the capability to dynamically spawn specialized subagents to run concurrent tasks for you. If you choose to spawn subagents, print one or more lines in this exact format (each on its own line):\nSPAWN_SUBAGENT:name=<Name>,role=<Role>,model=<claude|gemini|grok|codex>\nYou can spawn as many subagents as you deem necessary to complete the task.",
@@ -56,12 +61,18 @@ impl CliMediator {
         }
 
         // Print visual confirmation of orchestrator routing and folder harness to user stdout stream
+        let display_model_info = if let Some(ref m) = specific_model {
+            format!("{} ({})", final_model.to_uppercase(), m)
+        } else {
+            final_model.to_uppercase()
+        };
+
         let _ = app.emit("cli-output", ProcessOutputEvent {
             session_id: session_id.clone(),
             stream: "stdout".to_string(),
             data: format!(
                 "[ORCHESTRATOR] 🎯 Routing task automatically to: {} CLI based on intent.\n[ORCHESTRATOR] 📂 Harness Active Directory: {}\n\n",
-                final_model.to_uppercase(),
+                display_model_info,
                 workspace_root.to_string_lossy()
             ),
         });
@@ -75,55 +86,92 @@ impl CliMediator {
             match final_model.as_str() {
                 "claude" => {
                     let direct_path = r"C:\Users\User\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe";
-                    if let Ok(c) = Command::new(direct_path)
-                        .current_dir(&workspace_root)
-                        .arg("--print")
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                    {
+                    let mut cmd = Command::new(direct_path);
+                    cmd.current_dir(&workspace_root)
+                       .arg("--print")
+                       .stdin(Stdio::piped())
+                       .stdout(Stdio::piped())
+                       .stderr(Stdio::piped());
+                    if let Some(ref m) = specific_model {
+                        cmd.env("CLAUDE_MODEL", m);
+                        cmd.env("LLM_MODEL", m);
+                    }
+                    if let Ok(c) = cmd.spawn() {
                         println!("Direct claude.exe spawned successfully.");
                         spawned = Some(c);
                     }
                 }
                 "grok" => {
                     let direct_path = r"C:\Users\User\.grok\bin\grok.exe";
-                    if let Ok(c) = Command::new(direct_path)
-                        .current_dir(&workspace_root)
-                        .args(&["-c", "-p", &prompt_with_harness])
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                    {
+                    let mut cmd = Command::new(direct_path);
+                    cmd.current_dir(&workspace_root)
+                       .stdin(Stdio::piped())
+                       .stdout(Stdio::piped())
+                       .stderr(Stdio::piped());
+                    
+                    let mut args = vec!["-c"];
+                    if let Some(ref m) = specific_model {
+                        args.push("-m");
+                        args.push(m);
+                        cmd.env("GROK_MODEL", m);
+                        cmd.env("LLM_MODEL", m);
+                    }
+                    args.push("-p");
+                    args.push(&prompt_with_harness);
+                    cmd.args(&args);
+
+                    if let Ok(c) = cmd.spawn() {
                         println!("Direct grok.exe spawned successfully.");
                         spawned = Some(c);
                     }
                 }
                 "codex" => {
                     let direct_path = r"C:\Users\User\AppData\Roaming\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\codex\codex.exe";
+                    let mut cmd = Command::new(direct_path);
+                    cmd.current_dir(&workspace_root)
+                       .stdin(Stdio::piped())
+                       .stdout(Stdio::piped())
+                       .stderr(Stdio::piped());
+                       
+                    if let Some(ref m) = specific_model {
+                        cmd.env("OPENAI_MODEL", m);
+                        cmd.env("LLM_MODEL", m);
+                    }
+                    
                     // Try to resume the last session
-                    if let Ok(c) = Command::new(direct_path)
-                        .current_dir(&workspace_root)
-                        .args(&["exec", "resume", "--last", "--skip-git-repo-check", "-"])
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                    {
+                    let mut args = vec!["exec"];
+                    if let Some(ref m) = specific_model {
+                        args.push("--model");
+                        args.push(m);
+                    }
+                    
+                    let mut resume_args = args.clone();
+                    resume_args.push("resume");
+                    resume_args.push("--last");
+                    resume_args.push("--skip-git-repo-check");
+                    resume_args.push("-");
+                    
+                    let mut fallback_args = args.clone();
+                    fallback_args.push("--skip-git-repo-check");
+                    fallback_args.push("-");
+                    
+                    if let Ok(c) = cmd.args(&resume_args).spawn() {
                         println!("Direct codex.exe (resume last) spawned successfully.");
                         spawned = Some(c);
-                    } else if let Ok(c) = Command::new(direct_path)
-                        .current_dir(&workspace_root)
-                        .args(&["exec", "--skip-git-repo-check", "-"])
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                    {
-                        println!("Direct codex.exe spawned successfully.");
-                        spawned = Some(c);
+                    } else {
+                        let mut cmd2 = Command::new(direct_path);
+                        cmd2.current_dir(&workspace_root)
+                           .stdin(Stdio::piped())
+                           .stdout(Stdio::piped())
+                           .stderr(Stdio::piped());
+                        if let Some(ref m) = specific_model {
+                            cmd2.env("OPENAI_MODEL", m);
+                            cmd2.env("LLM_MODEL", m);
+                        }
+                        if let Ok(c) = cmd2.args(&fallback_args).spawn() {
+                            println!("Direct codex.exe spawned successfully.");
+                            spawned = Some(c);
+                        }
                     }
                 }
                 _ => {}
@@ -135,18 +183,45 @@ impl CliMediator {
                 let mut cmd = Command::new("cmd");
                 cmd.current_dir(&workspace_root);
                 cmd.arg("/C");
+                
+                if let Some(ref m) = specific_model {
+                    cmd.env("CLAUDE_MODEL", m);
+                    cmd.env("GEMINI_MODEL", m);
+                    cmd.env("GROK_MODEL", m);
+                    cmd.env("OPENAI_MODEL", m);
+                    cmd.env("LLM_MODEL", m);
+                }
+                
                 match final_model.as_str() {
                     "claude" => {
                         cmd.args(&["claude", "--print"]);
                     }
                     "grok" => {
-                        cmd.args(&["grok", "-c", "-p", &prompt_with_harness]);
+                        let mut args = vec!["grok", "-c"];
+                        if let Some(ref m) = specific_model {
+                            args.push("-m");
+                            args.push(m);
+                        }
+                        args.push("-p");
+                        args.push(&prompt_with_harness);
+                        cmd.args(&args);
                     }
                     "codex" => {
-                        cmd.args(&["codex", "exec", "resume", "--last", "--skip-git-repo-check", &prompt_with_harness]);
+                        let mut args = vec!["codex", "exec", "resume", "--last", "--skip-git-repo-check"];
+                        if let Some(ref m) = specific_model {
+                            args.push("--model");
+                            args.push(m);
+                        }
+                        args.push(&prompt_with_harness);
+                        cmd.args(&args);
                     }
                     "gemini" => {
-                        cmd.arg("gemini");
+                        let mut args = vec!["gemini"];
+                        if let Some(ref m) = specific_model {
+                            args.push("--model");
+                            args.push(m);
+                        }
+                        cmd.args(&args);
                     }
                     _ => {
                         return Err(format!("Unsupported model/CLI: {}", final_model));
@@ -170,10 +245,44 @@ impl CliMediator {
                 _ => return Err(format!("Unsupported model/CLI: {}", final_model)),
             });
             cmd.current_dir(&workspace_root);
+            
+            if let Some(ref m) = specific_model {
+                cmd.env("CLAUDE_MODEL", m);
+                cmd.env("GEMINI_MODEL", m);
+                cmd.env("GROK_MODEL", m);
+                cmd.env("OPENAI_MODEL", m);
+                cmd.env("LLM_MODEL", m);
+            }
+
             match final_model.as_str() {
                 "claude" => { cmd.arg("--print"); }
-                "grok" => { cmd.args(&["-c", "-p", &prompt_with_harness]); }
-                "codex" => { cmd.args(&["exec", "resume", "--last", "--skip-git-repo-check", "-"]); }
+                "grok" => {
+                    let mut args = vec!["-c"];
+                    if let Some(ref m) = specific_model {
+                        args.push("-m");
+                        args.push(m);
+                    }
+                    args.push("-p");
+                    args.push(&prompt_with_harness);
+                    cmd.args(&args);
+                }
+                "codex" => {
+                    let mut args = vec!["exec", "resume", "--last", "--skip-git-repo-check"];
+                    if let Some(ref m) = specific_model {
+                        args.push("--model");
+                        args.push(m);
+                    }
+                    args.push("-");
+                    cmd.args(&args);
+                }
+                "gemini" => {
+                    let mut args = Vec::new();
+                    if let Some(ref m) = specific_model {
+                        args.push("--model");
+                        args.push(m);
+                    }
+                    cmd.args(&args);
+                }
                 _ => {}
             }
             cmd.stdin(Stdio::piped())

@@ -357,12 +357,27 @@
     }
   }
   
+  // Model mapping configuration
+  const providerModelsMap: Record<string, string[]> = {
+    claude: ["claude-3-5-sonnet", "claude-3-5-haiku", "claude-3-opus", "claude-3-7-sonnet"],
+    gemini: ["gemini-2.0-flash", "gemini-2.0-pro", "gemini-1.5-pro", "gemini-1.5-flash"],
+    grok: ["grok-2", "grok-beta", "grok-1.5"],
+    codex: ["gpt-4o", "gpt-4o-mini", "o1-mini", "o1-preview", "o3-mini"]
+  };
+
+  let defaultProviderModels = $state<Record<string, string>>({
+    claude: "claude-3-5-sonnet",
+    gemini: "gemini-2.0-flash",
+    grok: "grok-2",
+    codex: "gpt-4o"
+  });
+  
   // Subagent Control Panel State
-  let subagents = $state<Array<{ id: string, name: string, role: string, model: string, active: boolean, cost: string }>>([
-    { id: "sa-1", name: "Research Agent", role: "Codebase search & symbols", model: "grok", active: true, cost: "$0.02" },
-    { id: "sa-2b", name: "Backend Coder Agent", role: "Rust / API / backend services", model: "codex", active: false, cost: "$0.03" },
-    { id: "sa-2f", name: "Frontend Coder Agent", role: "Svelte / TS / styling design", model: "claude", active: false, cost: "$0.03" },
-    { id: "sa-3", name: "Verification Agent", role: "Cargo check / test execution", model: "gemini", active: true, cost: "$0.01" }
+  let subagents = $state<Array<{ id: string, name: string, role: string, model: string, specificModel: string, active: boolean, cost: string }>>([
+    { id: "sa-1", name: "Research Agent", role: "Codebase search & symbols", model: "grok", specificModel: "grok-2", active: true, cost: "$0.02" },
+    { id: "sa-2b", name: "Backend Coder Agent", role: "Rust / API / backend services", model: "codex", specificModel: "gpt-4o", active: false, cost: "$0.03" },
+    { id: "sa-2f", name: "Frontend Coder Agent", role: "Svelte / TS / styling design", model: "claude", specificModel: "claude-3-5-sonnet", active: false, cost: "$0.03" },
+    { id: "sa-3", name: "Verification Agent", role: "Cargo check / test execution", model: "gemini", specificModel: "gemini-2.0-flash", active: true, cost: "$0.01" }
   ]);
 
   // nTropy Learning Loop Skills
@@ -458,7 +473,8 @@
         sessionId: `task-session-${task.id}`,
         model: task.cli,
         prompt: task.command,
-        agentMappings: getAgentMappings()
+        agentMappings: getAgentMappings(),
+        providerModels: getProviderModels()
       });
     } catch (e) {
       tasks = tasks.map(t => t.id === task.id ? { 
@@ -557,18 +573,21 @@
       unlistenSpawnSubagent = await listen("spawn-subagent", (event: any) => {
         const payload: any = event.payload;
         const saId = `sa-spawned-${Date.now()}`;
+        const provider = (payload.model || "claude").toLowerCase();
+        const specificModel = defaultProviderModels[provider] || (providerModelsMap[provider] ? providerModelsMap[provider][0] : "claude-3-5-sonnet");
         
         const newSa = {
           id: saId,
           name: payload.name,
           role: payload.role,
-          model: payload.model || "claude",
+          model: provider,
+          specificModel: specificModel,
           active: true,
           cost: "$0.01"
         };
         
         subagents = [...subagents, newSa];
-        addMessageToActiveConversation("Security Kernel", `🚀 Dynamic Subagent Spawned: "${payload.name}" (${payload.role}) utilizing model: ${payload.model.toUpperCase()} CLI`, 'system');
+        addMessageToActiveConversation("Security Kernel", `🚀 Dynamic Subagent Spawned: "${payload.name}" (${payload.role}) utilizing model: ${provider.toUpperCase()} (${specificModel}) CLI`, 'system');
       });
 
       // 5. Fetch Rules parsed dynamically from C:\Users\User\Desktop\dev-rules\index.html
@@ -726,7 +745,8 @@
         sessionId: "active-workspace-session",
         model: activeModel,
         prompt: currentPrompt,
-        agentMappings: getAgentMappings()
+        agentMappings: getAgentMappings(),
+        providerModels: getProviderModels()
       });
     } catch (e) {
       updateStreamingMessageText(streamMsgId, `CLI Fail: ${e}`);
@@ -751,10 +771,30 @@
   function toggleSubagentModel(id: string, model: string) {
     subagents = subagents.map(sa => {
       if (sa.id === id) {
-        return { ...sa, model };
+        const defaultSpecific = defaultProviderModels[model] || (providerModelsMap[model] ? providerModelsMap[model][0] : "");
+        return { ...sa, model, specificModel: defaultSpecific };
       }
       return sa;
     });
+  }
+
+  function toggleSubagentSpecificModel(id: string, specificModel: string) {
+    subagents = subagents.map(sa => {
+      if (sa.id === id) {
+        return { ...sa, specificModel };
+      }
+      return sa;
+    });
+  }
+
+  function getProviderModels(): Record<string, string> {
+    const models: Record<string, string> = { ...defaultProviderModels };
+    subagents.forEach(sa => {
+      if (sa.active) {
+        models[sa.model] = sa.specificModel;
+      }
+    });
+    return models;
   }
 
   function getAgentMappings(): Record<string, string> {
@@ -991,6 +1031,21 @@
             </select>
             <span class="select-arrow">▼</span>
           </div>
+
+          <!-- Secondary Specific Model Selector -->
+          <span class="model-bar-title" style="margin-left: 1.2rem;">Underlying Model:</span>
+          <div class="model-select-wrapper">
+            <select 
+              class="model-select-dropdown" 
+              value={defaultProviderModels[activeModel]} 
+              onchange={(e: any) => defaultProviderModels[activeModel] = e.target.value}
+            >
+              {#each providerModelsMap[activeModel] || [] as specificOption}
+                <option value={specificOption}>{specificOption}</option>
+              {/each}
+            </select>
+            <span class="select-arrow">▼</span>
+          </div>
         </div>
 
         <!-- Unified Chat Pane -->
@@ -1184,14 +1239,24 @@
                   <div class="sa-role">{sa.role}</div>
                   
                   <!-- Allocation controls -->
-                  <div class="sa-controls">
-                    <span class="lbl">LLM:</span>
-                    <select value={sa.model} onchange={(e: any) => toggleSubagentModel(sa.id, e.target.value)}>
-                      <option value="claude">Claude CLI</option>
-                      <option value="gemini">Gemini</option>
-                      <option value="grok">Grok CLI</option>
-                      <option value="codex">Codex</option>
-                    </select>
+                  <div class="sa-controls" style="display: flex; flex-direction: column; align-items: stretch; gap: 0.35rem;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.45rem;">
+                      <span class="lbl" style="min-width: 32px;">LLM:</span>
+                      <select value={sa.model} onchange={(e: any) => toggleSubagentModel(sa.id, e.target.value)} style="flex: 1;">
+                        <option value="claude">Claude CLI</option>
+                        <option value="gemini">Gemini</option>
+                        <option value="grok">Grok CLI</option>
+                        <option value="codex">Codex</option>
+                      </select>
+                    </div>
+                    <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.45rem;">
+                      <span class="lbl" style="min-width: 32px;">Model:</span>
+                      <select value={sa.specificModel} onchange={(e: any) => toggleSubagentSpecificModel(sa.id, e.target.value)} style="flex: 1;">
+                        {#each providerModelsMap[sa.model] || [] as specificOption}
+                          <option value={specificOption}>{specificOption}</option>
+                        {/each}
+                      </select>
+                    </div>
                   </div>
                 </div>
               {/each}

@@ -28,6 +28,7 @@ fn run_cli_prompt(
     model: String,
     prompt: String,
     agent_mappings: Option<std::collections::HashMap<String, String>>,
+    provider_models: Option<std::collections::HashMap<String, String>>,
 ) -> Result<(), String> {
     let workspace_root = state.symbol_indexer.workspace_root.lock().unwrap().clone();
     state.cli_mediator.send_prompt(app, PromptRequest {
@@ -35,6 +36,7 @@ fn run_cli_prompt(
         model,
         prompt,
         agent_mappings,
+        provider_models,
     }, workspace_root)
 }
 
