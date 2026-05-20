@@ -164,7 +164,91 @@
     }
   }
 
-  function createNewConversation(projectPath: string, initialTitle = "New Conversation"): string {
+  async function loadProjectDatabaseState() {
+    if (!currentProjectPath) return;
+    try {
+      // 1. Load sessions from SQLite
+      const dbSessions: any[] = await invoke("get_all_sessions");
+      
+      const loadedConvs: Conversation[] = [];
+      for (const s of dbSessions) {
+        const [id, title, created_at, updated_at] = s;
+        
+        // Fetch messages for this session
+        const dbMsgs: any[] = await invoke("get_session_messages", { sessionId: id });
+        const messages = dbMsgs.map((m: any) => {
+          const [role, content, msg_created_at] = m;
+          let sender = "System";
+          let type: 'user' | 'agent' | 'system' = 'system';
+          if (role.includes('|')) {
+            const parts = role.split('|');
+            sender = parts[0];
+            type = parts[1] as any;
+          } else {
+            sender = role;
+            if (role === "User") type = 'user';
+            else if (role.toLowerCase().includes("agent")) type = 'agent';
+            else type = 'system';
+          }
+          return { sender, text: content, type };
+        });
+        
+        loadedConvs.push({
+          id,
+          projectPath: currentProjectPath,
+          title,
+          lastUpdated: new Date(updated_at).getTime(),
+          messages,
+          activeModel: "claude"
+        });
+      }
+      
+      conversations = loadedConvs;
+      
+      if (conversations.length > 0) {
+        activeConversationId = conversations[0].id;
+      } else {
+        await createNewConversation(currentProjectPath);
+      }
+      
+      // 2. Load tasks from SQLite
+      const dbTasks: any[] = await invoke("get_all_tasks");
+      tasks = dbTasks.map((t: any) => {
+        const [id, session_id, text, status, created_at, updated_at] = t;
+        let name = text;
+        let command = text;
+        let cli = "claude";
+        let schedule = "once";
+        try {
+          if (text.startsWith("{") && text.endsWith("}")) {
+            const parsed = JSON.parse(text);
+            name = parsed.name || text;
+            command = parsed.command || text;
+            cli = parsed.cli || "claude";
+            schedule = parsed.schedule || "once";
+          }
+        } catch (e) {
+          // Fallback if not JSON
+        }
+        return {
+          id,
+          projectPath: currentProjectPath,
+          name,
+          command,
+          cli,
+          schedule,
+          status: status === "active" ? "active" : (status === "paused" ? "paused" : "running"),
+          lastRun: new Date(updated_at).getTime(),
+          lastResult: status === "completed" ? "success" : (status === "failed" ? "failed" : null),
+          lastOutput: ""
+        };
+      });
+    } catch (e) {
+      console.error("Failed to load project database state:", e);
+    }
+  }
+
+  async function createNewConversation(projectPath: string, initialTitle = "New Conversation"): Promise<string> {
     const newId = `conv-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     const newConv: Conversation = {
       id: newId,
@@ -176,13 +260,19 @@
     };
     conversations = [newConv, ...conversations];
     activeConversationId = newId;
-    saveConversations();
+    
+    try {
+      await invoke("create_session", { id: newId, title: initialTitle });
+    } catch (e) {
+      console.error("Failed to create session in SQLite:", e);
+    }
+    
     return newId;
   }
 
-  function handleNewConversationClick() {
+  async function handleNewConversationClick() {
     if (!currentProjectPath) return;
-    createNewConversation(currentProjectPath);
+    await createNewConversation(currentProjectPath);
     currentView = "chat";
   }
 
@@ -195,7 +285,7 @@
     showContextMenu = true;
   }
 
-  function deleteConversation(id: string) {
+  async function deleteConversation(id: string) {
     conversations = conversations.filter(c => c.id !== id);
     if (activeConversationId === id) {
       const currentProjConvs = conversations.filter(c => c.projectPath === currentProjectPath);
@@ -208,42 +298,22 @@
         activeConversationId = null;
       }
     }
-    saveConversations();
+    try {
+      await invoke("delete_session", { id });
+    } catch (e) {
+      console.error("Failed to delete session in SQLite:", e);
+    }
     showContextMenu = false;
   }
 
-  function saveConversations() {
-    try {
-      localStorage.setItem("nTropy_conversations", JSON.stringify(conversations));
-      localStorage.setItem("nTropy_active_conv_id", activeConversationId || "");
-    } catch (e) {
-      console.error("Failed to save conversations:", e);
-    }
-  }
-
-  function loadConversations() {
-    try {
-      const stored = localStorage.getItem("nTropy_conversations");
-      if (stored) {
-        conversations = JSON.parse(stored);
-      }
-      const activeId = localStorage.getItem("nTropy_active_conv_id");
-      if (activeId && conversations.some(c => c.id === activeId)) {
-        activeConversationId = activeId;
-      }
-    } catch (e) {
-      console.error("Failed to load conversations:", e);
-    }
-  }
-
-  function addMessageToActiveConversation(sender: string, text: string, type: 'user' | 'agent' | 'system', id?: string) {
+  async function addMessageToActiveConversation(sender: string, text: string, type: 'user' | 'agent' | 'system', id?: string) {
     if (!activeConversationId) return;
     conversations = conversations.map(c => {
       if (c.id === activeConversationId) {
-        // Automatically set conversation title from first user prompt
         let title = c.title;
         if (title === "New Conversation" && type === "user") {
           title = text.length > 25 ? text.substring(0, 25) + "..." : text;
+          invoke("create_session", { id: c.id, title });
         }
         return {
           ...c,
@@ -254,7 +324,16 @@
       }
       return c;
     });
-    saveConversations();
+
+    try {
+      await invoke("add_session_message", {
+        sessionId: activeConversationId,
+        role: `${sender}|${type}`,
+        content: text
+      });
+    } catch (e) {
+      console.error("Failed to add message to SQLite:", e);
+    }
   }
 
   function updateStreamingMessageText(msgId: string, text: string) {
@@ -273,7 +352,6 @@
       }
       return c;
     });
-    saveConversations();
   }
 
   function loadRecentProjects() {
@@ -332,16 +410,8 @@
       currentProjectPath = path;
       addRecentProject(path);
       
-      // Load or create a conversation for this project
-      const projConvs = conversations.filter(c => c.projectPath === path);
-      if (projConvs.length > 0) {
-        // Sort by lastUpdated descending and pick the most recent one
-        const sorted = [...projConvs].sort((a, b) => b.lastUpdated - a.lastUpdated);
-        activeConversationId = sorted[0].id;
-      } else {
-        createNewConversation(path);
-      }
-      saveConversations();
+      // Load everything from the SQLite database
+      await loadProjectDatabaseState();
       
       if (files.length > 0) {
         selectedFile = files[0];
@@ -353,7 +423,15 @@
       await refreshSkills();
     } catch (e) {
       console.error("Failed to open project:", e);
-      addMessageToActiveConversation("Workspace Engine", `❌ Error opening project: ${e}`, 'system');
+      conversations = [{
+        id: `conv-fallback`,
+        projectPath: path,
+        title: "Workspace Load Error",
+        lastUpdated: Date.now(),
+        messages: [{ sender: "Workspace Engine", text: `❌ Error opening project: ${e}`, type: 'system' }],
+        activeModel: "claude"
+      }];
+      activeConversationId = `conv-fallback`;
     }
   }
   
@@ -389,29 +467,11 @@
   let pendingApproval = $state<{ id: string, type: string, action: string, path: string } | null>(null);
 
   // Scheduled Tasks Functions
-  function saveTasks() {
-    try {
-      localStorage.setItem("nTropy_tasks", JSON.stringify(tasks));
-    } catch (e) {
-      console.error("Failed to save tasks:", e);
-    }
-  }
-
-  function loadTasks() {
-    try {
-      const stored = localStorage.getItem("nTropy_tasks");
-      if (stored) {
-        tasks = JSON.parse(stored);
-      }
-    } catch (e) {
-      console.error("Failed to load tasks:", e);
-    }
-  }
-
-  function createNewTask(name: string, command: string, cli: string, schedule: string) {
-    if (!currentProjectPath) return;
+  async function createNewTask(name: string, command: string, cli: string, schedule: string) {
+    if (!currentProjectPath || !activeConversationId) return;
+    const newId = `task-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     const newTask: ScheduledTask = {
-      id: `task-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      id: newId,
       projectPath: currentProjectPath,
       name,
       command,
@@ -423,24 +483,46 @@
       lastOutput: ""
     };
     tasks = [...tasks, newTask];
-    saveTasks();
+    
+    // Save to SQLite
+    try {
+      const textJson = JSON.stringify({
+        name,
+        command,
+        cli,
+        schedule
+      });
+      await invoke("create_task", { id: newId, sessionId: activeConversationId, text: textJson });
+    } catch (e) {
+      console.error("Failed to create task in SQLite:", e);
+    }
+    
     streamLogs = [...streamLogs, `[TASK RUNNER] Registered task: "${name}"`];
   }
 
-  function deleteTask(id: string) {
+  async function deleteTask(id: string) {
     tasks = tasks.filter(t => t.id !== id);
-    saveTasks();
+    try {
+      await invoke("delete_task", { id });
+    } catch (e) {
+      console.error("Failed to delete task in SQLite:", e);
+    }
   }
 
-  function toggleTaskStatus(id: string) {
+  async function toggleTaskStatus(id: string) {
+    let nextStatus: 'active' | 'paused' | 'running' = 'active';
     tasks = tasks.map(t => {
       if (t.id === id) {
-        const nextStatus = t.status === 'active' ? 'paused' : 'active';
+        nextStatus = t.status === 'active' ? 'paused' : 'active';
         return { ...t, status: nextStatus };
       }
       return t;
     });
-    saveTasks();
+    try {
+      await invoke("update_task_status", { id, status: nextStatus });
+    } catch (e) {
+      console.error("Failed to update task status in SQLite:", e);
+    }
   }
 
   function getIntervalMs(schedule: string): number | null {
@@ -464,7 +546,12 @@
       status: 'running', 
       lastOutput: `[${new Date().toLocaleTimeString()}] Task triggered...\n` 
     } : t);
-    saveTasks();
+    
+    try {
+      await invoke("update_task_status", { id: task.id, status: 'running' });
+    } catch (e) {
+      console.error("Failed to update task status in SQLite:", e);
+    }
 
     try {
       streamLogs = [...streamLogs, `[TASK RUNNER] Triggered task "${task.name}" using CLI "${task.cli.toUpperCase()}"`];
@@ -477,22 +564,24 @@
         providerModels: getProviderModels()
       });
     } catch (e) {
+      const finalStatus = task.schedule === 'once' ? 'paused' : 'active';
       tasks = tasks.map(t => t.id === task.id ? { 
         ...t, 
-        status: t.schedule === 'once' ? 'paused' : 'active',
+        status: finalStatus,
         lastRun: Date.now(),
         lastResult: 'failed',
         lastOutput: t.lastOutput + `\nExecution Error: ${e}\n` 
       } : t);
-      saveTasks();
+      
+      try {
+        await invoke("update_task_status", { id: task.id, status: finalStatus });
+      } catch (err) {
+        console.error("Failed to update task status in SQLite:", err);
+      }
     }
   }
 
   onMount(() => {
-    // 1. Load local historical state
-    loadConversations();
-    loadTasks();
-
     let unlistenCliOutput: any = null;
     let unlistenCliFinished: any = null;
     let unlistenSpawnSubagent: any = null;
@@ -551,9 +640,10 @@
         const session_id: any = event.payload;
         if (session_id.startsWith("task-session-")) {
           const taskId = session_id.replace("task-session-", "");
+          let finalStatus: 'active' | 'paused' | 'running' = 'active';
           tasks = tasks.map(t => {
             if (t.id === taskId) {
-              const finalStatus = t.schedule === 'once' ? 'paused' : 'active';
+              finalStatus = t.schedule === 'once' ? 'paused' : 'active';
               return {
                 ...t,
                 status: finalStatus,
@@ -564,7 +654,9 @@
             }
             return t;
           });
-          saveTasks();
+          invoke("update_task_status", { id: taskId, status: finalStatus }).catch(e => {
+            console.error("Failed to update task status in SQLite:", e);
+          });
           streamLogs = [...streamLogs, `[TASK RUNNER] Task execution finished: ${taskId}`];
         }
       });
@@ -613,14 +705,7 @@
           // Load files
           files = await invoke("open_project", { path: currentProjectPath });
           
-          // Load or create conversation for this project
-          const projConvs = conversations.filter(c => c.projectPath === currentProjectPath);
-          if (projConvs.length > 0) {
-            const sorted = [...projConvs].sort((a, b) => b.lastUpdated - a.lastUpdated);
-            activeConversationId = sorted[0].id;
-          } else {
-            createNewConversation(currentProjectPath);
-          }
+          await loadProjectDatabaseState();
           
           if (files.length > 0) {
             selectedFile = files[0];
@@ -765,7 +850,6 @@
       }
       return c;
     });
-    saveConversations();
   }
 
   function toggleSubagentModel(id: string, model: string) {

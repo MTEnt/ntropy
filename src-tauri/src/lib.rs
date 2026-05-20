@@ -1,23 +1,28 @@
 mod cli_mediator;
 mod rules_engine;
 mod symbol_indexer;
-mod ntropy_loop;
+mod db;
 
 use cli_mediator::{CliMediator, PromptRequest};
 use rules_engine::{RulesEngine, RulesManifest, Rule};
 use symbol_indexer::{SymbolIndexer, FileSymbols};
-use ntropy_loop::{NTropyLoopManager, SkillMetadata};
-
 
 use std::path::{PathBuf, Path};
 use std::fs;
 use tauri::{AppHandle, State, Manager};
 
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct SkillMetadata {
+    pub name: String,
+    pub description: String,
+    pub trigger_phrases: Vec<String>,
+}
+
 pub struct AppState {
     pub cli_mediator: CliMediator,
     pub rules_engine: RulesEngine,
     pub symbol_indexer: SymbolIndexer,
-    pub ntropy_manager: NTropyLoopManager,
+    pub db: std::sync::Mutex<std::sync::Arc<db::Database>>,
 }
 
 #[tauri::command]
@@ -60,26 +65,197 @@ fn index_symbols(state: State<'_, AppState>, relative_path: String) -> Result<Fi
     state.symbol_indexer.index_file(&relative_path)
 }
 
+// --- Dynamic Swapped project Database Commands ---
+
 #[tauri::command]
-fn get_skills_index(state: State<'_, AppState>) -> Result<Vec<SkillMetadata>, String> {
-    Ok(state.ntropy_manager.get_level0_index())
+async fn get_all_sessions(state: State<'_, AppState>) -> Result<Vec<(String, String, String, String)>, String> {
+    let db = {
+        let guard = state.db.lock().unwrap();
+        guard.clone()
+    };
+    db.get_all_sessions().await
 }
 
 #[tauri::command]
-fn get_skill_text(state: State<'_, AppState>, name: String) -> Result<String, String> {
-    state.ntropy_manager.get_level1_detail(&name)
-        .ok_or_else(|| format!("Skill '{}' not found", name))
+async fn create_session(state: State<'_, AppState>, id: String, title: String) -> Result<(), String> {
+    let db = {
+        let guard = state.db.lock().unwrap();
+        guard.clone()
+    };
+    db.create_session(id, title).await
 }
 
 #[tauri::command]
-fn save_skill(
+async fn delete_session(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let db = {
+        let guard = state.db.lock().unwrap();
+        guard.clone()
+    };
+    db.delete_session(id).await
+}
+
+#[tauri::command]
+async fn get_session_messages(state: State<'_, AppState>, session_id: String) -> Result<Vec<(String, String, String)>, String> {
+    let db = {
+        let guard = state.db.lock().unwrap();
+        guard.clone()
+    };
+    db.get_session_messages(session_id).await
+}
+
+#[tauri::command]
+async fn add_session_message(state: State<'_, AppState>, session_id: String, role: String, content: String) -> Result<(), String> {
+    let db = {
+        let guard = state.db.lock().unwrap();
+        guard.clone()
+    };
+    db.add_session_message(session_id, role, content).await
+}
+
+#[tauri::command]
+async fn get_all_tasks(state: State<'_, AppState>) -> Result<Vec<(String, String, String, String, String, String)>, String> {
+    let db = {
+        let guard = state.db.lock().unwrap();
+        guard.clone()
+    };
+    db.get_all_tasks().await
+}
+
+#[tauri::command]
+async fn create_task(state: State<'_, AppState>, id: String, session_id: String, text: String) -> Result<(), String> {
+    let db = {
+        let guard = state.db.lock().unwrap();
+        guard.clone()
+    };
+    db.create_task(id, session_id, text).await
+}
+
+#[tauri::command]
+async fn update_task_status(state: State<'_, AppState>, id: String, status: String) -> Result<(), String> {
+    let db = {
+        let guard = state.db.lock().unwrap();
+        guard.clone()
+    };
+    db.update_task_status(id, status).await
+}
+
+#[tauri::command]
+async fn delete_task(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let db = {
+        let guard = state.db.lock().unwrap();
+        guard.clone()
+    };
+    db.delete_task(id).await
+}
+
+// --- HTML-Based Skills database queries ---
+
+#[tauri::command]
+async fn get_skills_index(state: State<'_, AppState>) -> Result<Vec<SkillMetadata>, String> {
+    let db = {
+        let guard = state.db.lock().unwrap();
+        guard.clone()
+    };
+    let list = db.get_all_skills().await?;
+    let mut mapped = Vec::new();
+    for (name, description, trigger_tags, _, enabled) in list {
+        if enabled {
+            let triggers = trigger_tags.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>();
+            mapped.push(SkillMetadata {
+                name,
+                description,
+                trigger_phrases: triggers,
+            });
+        }
+    }
+    
+    // Seed default skills if empty to guarantee beautiful user onboarding
+    if mapped.is_empty() {
+        let default_skills = vec![
+            (
+                "Safe Git Push",
+                "Validates, commits, and pushes code under MTEnt identity.",
+                "push updates,git push",
+                r#"<skill name="Safe Git Push" description="Validates, commits, and pushes code under MTEnt identity.">
+  <triggers>
+    <trigger>push updates</trigger>
+    <trigger>git push</trigger>
+  </triggers>
+  <steps>
+    <step>Verify git status has no stray or untracked changes.</step>
+    <step>Commit modified files with a clear description on behalf of MTEnt.</step>
+    <step>Push the commits safely to origin main.</step>
+  </steps>
+</skill>"#
+            ),
+            (
+                "HTML Prompt Refactor",
+                "Refactors procedural flows to use precise structural HTML tags.",
+                "refactor prompt,html skill",
+                r#"<skill name="HTML Prompt Refactor" description="Refactors procedural flows to use precise structural HTML tags.">
+  <triggers>
+    <trigger>refactor prompt</trigger>
+    <trigger>html skill</trigger>
+  </triggers>
+  <steps>
+    <step>Extract the loose procedural instructions from prompts.</step>
+    <step>Translate instructions into semantic HTML elements like &lt;steps&gt; and &lt;step&gt;.</step>
+    <step>Inject the clean, boundary-accurate HTML block back into the orchestrator context.</step>
+  </steps>
+</skill>"#
+            )
+        ];
+        
+        for (name, desc, triggers, body) in default_skills {
+            let _ = db.create_or_update_skill(name.to_string(), desc.to_string(), triggers.to_string(), body.to_string()).await;
+        }
+        
+        let list2 = db.get_all_skills().await?;
+        for (name, description, trigger_tags, _, enabled) in list2 {
+            if enabled {
+                let triggers = trigger_tags.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>();
+                mapped.push(SkillMetadata {
+                    name,
+                    description,
+                    trigger_phrases: triggers,
+                });
+            }
+        }
+    }
+    
+    Ok(mapped)
+}
+
+#[tauri::command]
+async fn get_skill_text(state: State<'_, AppState>, name: String) -> Result<String, String> {
+    let db = {
+        let guard = state.db.lock().unwrap();
+        guard.clone()
+    };
+    let list = db.get_all_skills().await?;
+    for (skill_name, _, _, definition, _) in list {
+        if skill_name.to_lowercase() == name.to_lowercase() {
+            return Ok(definition);
+        }
+    }
+    Err(format!("Skill '{}' not found in database", name))
+}
+
+#[tauri::command]
+async fn save_skill(
     state: State<'_, AppState>,
     name: String,
     description: String,
     triggers: Vec<String>,
-    markdown: String,
+    markdown: String, // Kept parameter name 'markdown' to not break Svelte bindings
 ) -> Result<String, String> {
-    state.ntropy_manager.distill_new_skill(&name, &description, triggers, &markdown)
+    let db = {
+        let guard = state.db.lock().unwrap();
+        guard.clone()
+    };
+    let trigger_tags = triggers.join(",");
+    db.create_or_update_skill(name.clone(), description, trigger_tags, markdown).await?;
+    Ok(name)
 }
 
 #[tauri::command]
@@ -97,16 +273,16 @@ fn open_project(state: State<'_, AppState>, path: String) -> Result<Vec<String>,
     
     // Automatically scaffold missing project workspace structures
     let src_dir = p.join("src");
-    let skills_dir = p.join(".agents").join("skills");
+    let agents_dir = p.join(".agents");
     let readme_file = p.join("README.md");
     
     if !src_dir.exists() {
         fs::create_dir_all(&src_dir)
             .map_err(|e| format!("Failed to create project src directory: {}", e))?;
     }
-    if !skills_dir.exists() {
-        fs::create_dir_all(&skills_dir)
-            .map_err(|e| format!("Failed to create project skills directory: {}", e))?;
+    if !agents_dir.exists() {
+        fs::create_dir_all(&agents_dir)
+            .map_err(|e| format!("Failed to create project agents directory: {}", e))?;
     }
     if !readme_file.exists() {
         let folder_name = p.file_name()
@@ -118,7 +294,18 @@ fn open_project(state: State<'_, AppState>, path: String) -> Result<Vec<String>,
     }
     
     state.symbol_indexer.set_workspace_root(p.clone());
-    state.ntropy_manager.set_skills_dir(&p)?;
+    
+    // Dynamically swap project SQLite Connection
+    let db_path = agents_dir.join("nentropy.db");
+    let db_str = db_path.to_string_lossy().to_string();
+    let new_db = tauri::async_runtime::block_on(async {
+        db::Database::open(&db_str).await
+    })?;
+    
+    {
+        let mut db_guard = state.db.lock().unwrap();
+        *db_guard = std::sync::Arc::new(new_db);
+    }
     
     list_project_files(state)
 }
@@ -141,15 +328,26 @@ fn create_project(state: State<'_, AppState>, parent_dir: String, project_name: 
     fs::create_dir_all(project_path.join("src"))
         .map_err(|e| format!("Failed to create src directory: {}", e))?;
     
-    fs::create_dir_all(project_path.join(".agents").join("skills"))
-        .map_err(|e| format!("Failed to create skills directory: {}", e))?;
+    fs::create_dir_all(project_path.join(".agents"))
+        .map_err(|e| format!("Failed to create agents directory: {}", e))?;
     
     let readme_content = format!("# {}\n\nInitialized as an Agent OS workspace.", project_name);
     fs::write(project_path.join("README.md"), readme_content)
         .map_err(|e| format!("Failed to write README.md: {}", e))?;
         
     state.symbol_indexer.set_workspace_root(project_path.clone());
-    state.ntropy_manager.set_skills_dir(&project_path)?;
+    
+    // Dynamically swap project SQLite Connection
+    let db_path = project_path.join(".agents").join("nentropy.db");
+    let db_str = db_path.to_string_lossy().to_string();
+    let new_db = tauri::async_runtime::block_on(async {
+        db::Database::open(&db_str).await
+    })?;
+    
+    {
+        let mut db_guard = state.db.lock().unwrap();
+        *db_guard = std::sync::Arc::new(new_db);
+    }
     
     Ok(project_path.to_string_lossy().to_string())
 }
@@ -186,6 +384,7 @@ fn walk_dir_recursive(root: &Path, current: &Path, acc: &mut Vec<String>) -> Res
                 || relative.starts_with(".git") 
                 || relative.starts_with(".svelte-kit")
                 || relative.starts_with(".vscode")
+                || relative.starts_with(".agents")
             {
                 continue;
             }
@@ -208,12 +407,25 @@ pub fn run() {
             // Root paths based on Desktop conventions
             let workspace_root = PathBuf::from(r"C:\Users\User\Desktop\auto-os");
 
+            // Ensure .agents exists
+            let agents_dir = workspace_root.join(".agents");
+            if !agents_dir.exists() {
+                let _ = fs::create_dir_all(&agents_dir);
+            }
+
+            // Open SQLite Database connection
+            let db_path = agents_dir.join("nentropy.db");
+            let db_str = db_path.to_string_lossy().to_string();
+            let db = tauri::async_runtime::block_on(async {
+                db::Database::open(&db_str).await.expect("Failed to initialize SQLite database")
+            });
+
             // Initialize all core engines
             let state = AppState {
                 cli_mediator: CliMediator::new(),
                 rules_engine: RulesEngine::new(),
                 symbol_indexer: SymbolIndexer::new(workspace_root.clone()),
-                ntropy_manager: NTropyLoopManager::new(workspace_root),
+                db: std::sync::Mutex::new(std::sync::Arc::new(db)),
             };
 
             app.manage(state);
@@ -231,7 +443,16 @@ pub fn run() {
             open_project,
             create_project,
             list_project_files,
-            select_directory
+            select_directory,
+            get_all_sessions,
+            create_session,
+            delete_session,
+            get_session_messages,
+            add_session_message,
+            get_all_tasks,
+            create_task,
+            update_task_status,
+            delete_task
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

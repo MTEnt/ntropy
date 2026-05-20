@@ -33,5 +33,9 @@ notify = "8.2"
 thiserror = "2"
 regex = "1"
 rfd = "0.15"
+async-sqlite = { version = "0.5", default-features = false, features = ["bundled"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+
 
 
