@@ -94,6 +94,7 @@ impl CliMediator {
                        .stdout(Stdio::piped())
                        .stderr(Stdio::piped());
                     if let Some(ref m) = specific_model {
+                        cmd.arg("--model").arg(m);
                         cmd.env("CLAUDE_MODEL", m);
                         cmd.env("LLM_MODEL", m);
                     }
@@ -195,7 +196,12 @@ impl CliMediator {
                 
                 match final_model.as_str() {
                     "claude" => {
-                        cmd.args(&["claude", "--print", "--dangerously-skip-permissions"]);
+                        let mut args = vec!["claude", "--print", "--dangerously-skip-permissions"];
+                        if let Some(ref m) = specific_model {
+                            args.push("--model");
+                            args.push(m);
+                        }
+                        cmd.args(&args);
                     }
                     "grok" => {
                         let mut args = vec!["grok", "-c"];
@@ -257,7 +263,12 @@ impl CliMediator {
 
             match final_model.as_str() {
                 "claude" => {
-                    cmd.args(&["--print", "--dangerously-skip-permissions"]);
+                    let mut args = vec!["--print", "--dangerously-skip-permissions"];
+                    if let Some(ref m) = specific_model {
+                        args.push("--model");
+                        args.push(m);
+                    }
+                    cmd.args(&args);
                 }
                 "grok" => {
                     let mut args = vec!["-c"];
