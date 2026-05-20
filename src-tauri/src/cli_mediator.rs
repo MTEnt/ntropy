@@ -42,9 +42,15 @@ impl CliMediator {
         let session_id = req.session_id.clone();
         
         let final_model = route_task(&req.prompt, &req.model, req.agent_mappings.as_ref());
-        let specific_model = req.provider_models.as_ref()
+        let mut specific_model = req.provider_models.as_ref()
             .and_then(|m| m.get(&final_model))
             .cloned();
+            
+        if final_model == "claude" {
+            if let Some(ref m) = specific_model {
+                specific_model = Some(m.replace(".", "-"));
+            }
+        }
             
         let cleaned_prompt = clean_prompt(&req.prompt);
         let prompt_with_harness = format!(
