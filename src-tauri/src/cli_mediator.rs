@@ -111,7 +111,7 @@ impl CliMediator {
                        .stdout(Stdio::piped())
                        .stderr(Stdio::piped());
                     
-                    let mut args = vec!["-c"];
+                    let mut args = Vec::new();
                     if let Some(ref m) = specific_model {
                         args.push("-m");
                         args.push(m);
@@ -204,7 +204,7 @@ impl CliMediator {
                         cmd.args(&args);
                     }
                     "grok" => {
-                        let mut args = vec!["grok", "-c"];
+                        let mut args = vec!["grok"];
                         if let Some(ref m) = specific_model {
                             args.push("-m");
                             args.push(m);
@@ -271,7 +271,7 @@ impl CliMediator {
                     cmd.args(&args);
                 }
                 "grok" => {
-                    let mut args = vec!["-c"];
+                    let mut args = Vec::new();
                     if let Some(ref m) = specific_model {
                         args.push("-m");
                         args.push(m);
@@ -484,50 +484,7 @@ pub fn route_task(prompt: &str, requested_model: &str, mappings: Option<&HashMap
         return get_mapped_model("verification", "gemini");
     }
 
-    // 3. Keyword-based classification routing
-    
-    // Research / Exploration -> Grok CLI
-    let research_words = [
-        "research", "search", "find", "symbols", "explain", "codebase", 
-        "grep", "lookup", "locate", "explain how", "investigate", "analyze", 
-        "history", "what does", "how does"
-    ];
-    if research_words.iter().any(|&word| lower_prompt.contains(word)) {
-        return get_mapped_model("research", "grok");
-    }
-
-    // Backend Coder -> Codex CLI
-    let backend_words = [
-        "backend", "rust", "api", "cargo", "database", "db", "server", 
-        "endpoint", "sql", "handler", "route", "backend coder", "codex",
-        "actix", "axum", "diesel", "tokio"
-    ];
-    if backend_words.iter().any(|&word| lower_prompt.contains(word)) {
-        return get_mapped_model("backend", "codex");
-    }
-
-    // Frontend Coder -> Claude CLI
-    let frontend_words = [
-        "frontend", "svelte", "ts", "css", "html", "ui", "style", 
-        "component", "button", "layout", "div", "page", "client", 
-        "frontend coder", "claude", "navbar", "sidebar", "flexbox", 
-        "grid", "tailwind", "responsive"
-    ];
-    if frontend_words.iter().any(|&word| lower_prompt.contains(word)) {
-        return get_mapped_model("frontend", "claude");
-    }
-
-    // Verification -> Gemini CLI
-    let verification_words = [
-        "verify", "test", "check", "run tests", "compile", "audit", 
-        "lint", "validate", "verification", "gemini", "assert", 
-        "cargo check", "cargo test", "npm run check"
-    ];
-    if verification_words.iter().any(|&word| lower_prompt.contains(word)) {
-        return get_mapped_model("verification", "gemini");
-    }
-
-    // 4. Fallback to requested model
+    // 3. Fallback to requested model
     let req_model = requested_model.to_lowercase();
     if ["claude", "gemini", "grok", "codex"].contains(&req_model.as_str()) {
         req_model
