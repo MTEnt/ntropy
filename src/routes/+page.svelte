@@ -616,11 +616,11 @@
           const sanitized = sanitizeStdout(rawStreamingText);
           updateStreamingMessageText(activeStreamingMessageId, sanitized);
           
-          // Reset stream timeout
+          // Reset stream timeout (long fallback timeout of 60 seconds)
           if (streamTimeout) clearTimeout(streamTimeout);
           streamTimeout = setTimeout(() => {
             activeStreamingMessageId = null;
-          }, 1200);
+          }, 60000);
         }
 
         // Auto scroll terminal logs & chat scroller
@@ -638,7 +638,13 @@
       // 3. Listen for CLI task completion
       unlistenCliFinished = await listen("cli-finished", (event: any) => {
         const session_id: any = event.payload;
-        if (session_id.startsWith("task-session-")) {
+        if (session_id === "active-workspace-session") {
+          activeStreamingMessageId = null;
+          if (streamTimeout) {
+            clearTimeout(streamTimeout);
+            streamTimeout = null;
+          }
+        } else if (session_id.startsWith("task-session-")) {
           const taskId = session_id.replace("task-session-", "");
           let finalStatus: 'active' | 'paused' | 'running' = 'active';
           tasks = tasks.map(t => {
