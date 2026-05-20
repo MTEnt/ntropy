@@ -981,19 +981,16 @@
       {#if currentView === 'chat'}
         <!-- Global Switching Bar -->
         <div class="model-selection-bar">
-          <span class="model-bar-title">Default Chat:</span>
-          <button class="model-btn" class:active={activeModel === 'claude'} onclick={() => handleModelSwitch('claude')}>
-            Claude
-          </button>
-          <button class="model-btn" class:active={activeModel === 'gemini'} onclick={() => handleModelSwitch('gemini')}>
-            Gemini
-          </button>
-          <button class="model-btn" class:active={activeModel === 'grok'} onclick={() => handleModelSwitch('grok')}>
-            Grok
-          </button>
-          <button class="model-btn" class:active={activeModel === 'codex'} onclick={() => handleModelSwitch('codex')}>
-            Codex
-          </button>
+          <span class="model-bar-title">Active Chat LLM:</span>
+          <div class="model-select-wrapper">
+            <select class="model-select-dropdown" value={activeModel} onchange={(e: any) => handleModelSwitch(e.target.value)}>
+              <option value="claude">Claude Code CLI</option>
+              <option value="gemini">Gemini CLI</option>
+              <option value="grok">Grok CLI</option>
+              <option value="codex">Codex CLI</option>
+            </select>
+            <span class="select-arrow">▼</span>
+          </div>
         </div>
 
         <!-- Unified Chat Pane -->
@@ -1820,27 +1817,44 @@
     user-select: none;
   }
 
-  .model-btn {
-    padding: 0.4rem 1rem;
-    background: transparent;
-    border: 1px solid transparent;
-    color: var(--text-muted);
-    cursor: pointer;
+  .model-select-wrapper {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+  }
+
+  .model-select-dropdown {
+    appearance: none;
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    background: #1e1e20;
+    border: 1px solid var(--border-glass-bright);
+    color: var(--text-primary);
+    padding: 0.35rem 1.85rem 0.35rem 0.65rem;
     border-radius: 6px;
-    font-size: 0.8rem;
-    font-weight: 500;
+    font-size: 0.78rem;
+    font-weight: 600;
+    outline: none;
+    cursor: pointer;
     transition: all 0.15s ease;
   }
 
-  .model-btn:hover {
-    color: var(--text-primary);
-    background: #202022;
+  .model-select-dropdown:hover {
+    border-color: #52525b;
+    background: #27272a;
   }
 
-  .model-btn.active {
-    color: #ffffff;
-    border: 1px solid var(--border-glass-bright);
-    background: #27272a;
+  .model-select-dropdown:focus {
+    border-color: var(--text-primary);
+  }
+
+  .select-arrow {
+    position: absolute;
+    right: 0.65rem;
+    font-size: 0.55rem;
+    color: var(--text-muted);
+    pointer-events: none;
+    user-select: none;
   }
 
   .chat-container {
