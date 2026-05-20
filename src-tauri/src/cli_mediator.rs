@@ -94,16 +94,19 @@ impl CliMediator {
                     let direct_path = r"C:\Users\User\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe";
                     let mut cmd = Command::new(direct_path);
                     cmd.current_dir(&workspace_root)
-                       .arg("--print")
-                       .arg("--dangerously-skip-permissions")
                        .stdin(Stdio::piped())
                        .stdout(Stdio::piped())
                        .stderr(Stdio::piped());
+                    
+                    let mut args = vec!["--print", "--dangerously-skip-permissions"];
                     if let Some(ref m) = specific_model {
-                        cmd.arg("--model").arg(m);
+                        args.push("--model");
+                        args.push(m);
                         cmd.env("CLAUDE_MODEL", m);
                         cmd.env("LLM_MODEL", m);
                     }
+                    cmd.args(&args);
+
                     if let Ok(c) = cmd.spawn() {
                         println!("Direct claude.exe spawned successfully.");
                         spawned = Some(c);
