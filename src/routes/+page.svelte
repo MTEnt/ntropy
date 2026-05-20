@@ -359,25 +359,25 @@
   
   // Model mapping configuration
   const providerModelsMap: Record<string, string[]> = {
-    claude: ["claude-3-5-sonnet", "claude-3-5-haiku", "claude-3-opus", "claude-3-7-sonnet"],
-    gemini: ["gemini-2.0-flash", "gemini-2.0-pro", "gemini-1.5-pro", "gemini-1.5-flash"],
-    grok: ["grok-2", "grok-beta", "grok-1.5"],
-    codex: ["gpt-4o", "gpt-4o-mini", "o1-mini", "o1-preview", "o3-mini"]
+    claude: ["claude-opus-4.7", "claude-sonnet-4.6", "claude-haiku-4.5"],
+    gemini: ["gemini-3.5-flash", "gemini-3.5-pro", "gemini-3.1-pro", "gemini-3.1-flash-lite"],
+    grok: ["grok-4.3", "grok-code-fast-1", "grok-3"],
+    codex: ["gpt-5.5", "gpt-5.5-instant", "gpt-5.3-codex", "o3-pro", "o3"]
   };
 
   let defaultProviderModels = $state<Record<string, string>>({
-    claude: "claude-3-5-sonnet",
-    gemini: "gemini-2.0-flash",
-    grok: "grok-2",
-    codex: "gpt-4o"
+    claude: "claude-sonnet-4.6",
+    gemini: "gemini-3.5-flash",
+    grok: "grok-4.3",
+    codex: "gpt-5.5"
   });
   
   // Subagent Control Panel State
   let subagents = $state<Array<{ id: string, name: string, role: string, model: string, specificModel: string, active: boolean, cost: string }>>([
-    { id: "sa-1", name: "Research Agent", role: "Codebase search & symbols", model: "grok", specificModel: "grok-2", active: true, cost: "$0.02" },
-    { id: "sa-2b", name: "Backend Coder Agent", role: "Rust / API / backend services", model: "codex", specificModel: "gpt-4o", active: false, cost: "$0.03" },
-    { id: "sa-2f", name: "Frontend Coder Agent", role: "Svelte / TS / styling design", model: "claude", specificModel: "claude-3-5-sonnet", active: false, cost: "$0.03" },
-    { id: "sa-3", name: "Verification Agent", role: "Cargo check / test execution", model: "gemini", specificModel: "gemini-2.0-flash", active: true, cost: "$0.01" }
+    { id: "sa-1", name: "Research Agent", role: "Codebase search & symbols", model: "grok", specificModel: "grok-4.3", active: true, cost: "$0.02" },
+    { id: "sa-2b", name: "Backend Coder Agent", role: "Rust / API / backend services", model: "codex", specificModel: "gpt-5.3-codex", active: false, cost: "$0.03" },
+    { id: "sa-2f", name: "Frontend Coder Agent", role: "Svelte / TS / styling design", model: "claude", specificModel: "claude-sonnet-4.6", active: false, cost: "$0.03" },
+    { id: "sa-3", name: "Verification Agent", role: "Cargo check / test execution", model: "gemini", specificModel: "gemini-3.5-flash", active: true, cost: "$0.01" }
   ]);
 
   // nTropy Learning Loop Skills
@@ -574,7 +574,7 @@
         const payload: any = event.payload;
         const saId = `sa-spawned-${Date.now()}`;
         const provider = (payload.model || "claude").toLowerCase();
-        const specificModel = defaultProviderModels[provider] || (providerModelsMap[provider] ? providerModelsMap[provider][0] : "claude-3-5-sonnet");
+        const specificModel = defaultProviderModels[provider] || (providerModelsMap[provider] ? providerModelsMap[provider][0] : "claude-sonnet-4.6");
         
         const newSa = {
           id: saId,
