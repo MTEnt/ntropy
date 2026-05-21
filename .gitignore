@@ -8,3 +8,14 @@ node_modules
 !.env.example
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Local nTropy runtime state. Keep generated project databases out of git.
+.agents/nentropy.db
+.agents/nentropy.db-shm
+.agents/nentropy.db-wal
+.agents/*.sqlite
+.agents/*.sqlite-shm
+.agents/*.sqlite-wal
+.agents/*.sqlite3
+.agents/*.sqlite3-shm
+.agents/*.sqlite3-wal

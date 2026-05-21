@@ -101,19 +101,24 @@ impl RulesEngine {
         if rules_opt.is_none() {
             return Vec::new();
         }
-        
+
         let manifest = rules_opt.unwrap();
         let mut violations = Vec::new();
-        
+
         for rule in manifest.non_negotiables {
             // Basic trigger match
             if rule.trigger == trigger_type || rule.trigger == "always" {
                 // If it's NN-NO-UNRELATED-CHANGES and content matches rewrite patterns
-                if rule.id == "NN-NO-UNRELATED-CHANGES" && (content.contains("while I was here") || content.contains("refactored unrelated")) {
+                if rule.id == "NN-NO-UNRELATED-CHANGES"
+                    && (content.contains("while I was here")
+                        || content.contains("refactored unrelated"))
+                {
                     violations.push(rule.clone());
                 }
                 // If it's NN-TESTS-SACRED and content deletes tests
-                else if rule.id == "NN-TESTS-SACRED" && (content.contains("delete test") || content.contains("remove test")) {
+                else if rule.id == "NN-TESTS-SACRED"
+                    && (content.contains("delete test") || content.contains("remove test"))
+                {
                     violations.push(rule.clone());
                 }
                 // Fallback: simple trigger-matching rule warning
@@ -122,7 +127,7 @@ impl RulesEngine {
                 }
             }
         }
-        
+
         violations
     }
 }

@@ -1,109 +1,195 @@
-# nTropy ⚡
+# nTropy (auto-os)
 
-nTropy is a robust, state-of-the-art multi-agent orchestrator and development harness designed to lock AI capabilities inside a secure, project-bound workspace. Built with a highly responsive **Svelte 5** frontend and a performant, sandboxed **Rust + Tauri** backend, nTropy shifts the paradigm from simple single-model auto-completion to an autonomous, context-aware engineering team that respects local conventions and actively combats **AI Code Slop**.
+nTropy is a local desktop harness for routing prompts to installed AI coding CLIs from a Tauri + Svelte interface. It is built for full-permission local automation: it can open a workspace, store project conversations and tasks, launch model CLIs in that workspace, stream their output back into the UI, and let those CLIs make changes with the permissions of the signed-in operating system user.
 
----
+This is not a sandboxed security boundary. Treat it like a convenient control panel for powerful local developer tools.
 
-## 🎯 What Makes nTropy Unique?
+## Current Product Truth
 
-Most minimal harnesses (like simple shell wrappers or IDE extensions) suffer from severe limitations: they waste massive amounts of tokens by dumping entire files into the prompt (leading to **context collapse**), tie themselves to a single default model, lack safety sandboxing, and easily generate "AI slop"—thoughtless, bloated, unverified code that breaks pre-existing architectures. 
+nTropy currently provides:
 
-nTropy was built from the ground up to solve these architectural flaws through five core pillars:
+- A Svelte 5 desktop UI wrapped by Tauri 2.
+- A Rust backend that launches provider CLIs as child processes.
+- A workspace file browser and Tree-sitter symbol indexer for Rust, Python, JavaScript, and TypeScript files.
+- Local SQLite storage for chats, messages, tasks, and skill definitions.
+- Prompt routing across Claude, Gemini, Grok, and Codex CLIs.
+- Frontend-managed companion subagents that can be triggered manually or by a structured stdout line.
+- A lightweight rules panel and warning log for project conventions.
+- A task dashboard for manually run or interval-based prompts while the app is open.
 
-### 1. The Double-Zero Learning Loop (DZL)
-To prevent token bloat and context collapse, nTropy implements a **progressive disclosure model** for procedural skills, separating procedural knowledge into two distinct levels:
-*   **Level 0 (Metadata Index):** A low-cost index of available skills, matching trigger phrases and descriptions.
-*   **Level 1 (Detailed Specifications):** Detailed markdown-based action lists loaded on-demand only when a matching phrase is triggered.
-*   **Autonomous Skill Distiller:** Active agents can distill successful workflows into new, reusable skill files (`.agents/skills/*.md`), enabling nTropy to programmatically learn and adapt to your codebase.
+nTropy does not currently provide:
 
-### 2. Intent-Driven Multi-Model Orchestration
-No single LLM is optimal for every programming task. nTropy acts as a central mediator, automatically parsing user prompt intent and routing the execution to the specialized model/CLI chosen by the user for each section. The user gets to choose what they want to use for each section:
-*   🔎 **Research & Exploration:** Guided by your model choice (defaults to **Grok**), highly optimal for codebase search, symbol lookup, and deep codebase structure analysis.
-*   ⚙️ **Backend Engineering (Rust, APIs, DBs):** Routed to your model choice (defaults to **Codex**), optimized for low-level logic, performance, and API design.
-*   🎨 **Frontend UI & Components (Svelte, CSS):** Handled by your model choice (defaults to **Claude**), the leading engine for visual aesthetics, layouts, and Svelte component hierarchy.
-*   🛡️ **Verification & Safety Auditing:** Executed by your model choice (defaults to **Gemini**), specializing in validation tests, compiler diagnostics, and regression checks.
+- OS-level sandboxing, filesystem containment, network isolation, or rollback.
+- A guarantee that launched CLIs cannot read or write outside the selected workspace.
+- A hard security policy engine. The rules gate is advisory in the current implementation.
+- A durable background service. Scheduled tasks run from the app session.
+- A cross-user secret manager or encrypted chat database.
+- A guarantee that every listed provider model name is available to the installed CLI or account.
 
-*Note: You can easily customize these model mappings in the UI for each section or override the orchestrator on a per-prompt basis by prefixing prompts with `@grok`, `@codex`, `@claude`, or `@gemini`.*
+## Permission Model
 
-### 3. Dynamic Subagent Spawning
-Instead of relying on a rigid, pre-configured agent hierarchy, the primary executing CLI can evaluate task complexity in real-time. By outputting a structured instruction mid-stream:
-`SPAWN_SUBAGENT:name=<Name>,role=<Role>,model=<claude|gemini|grok|codex>`
-The Tauri kernel intercepts the stdout chunk and instantly spins up a concurrent companion subagent, parallelizing tasks dynamically.
+The app starts model CLIs with broad local permissions. The current launch paths intentionally prioritize automation over approval prompts:
 
-### 4. Anti-AI Slop "Rules Gate" (Human Code Rules v5.1)
-nTropy was designed with human code rules in mind and an evergrowing and evolving rule set that stops the AI from putting out slop code. Rather than relying on external desktop files, these non-negotiable architectural standards (such as `NN-NO-UNRELATED-CHANGES` or `NN-NO-ARCHITECTURE-REWRITE`) are baked directly into the application's built-in Rules Engine. Before edits are committed, nTropy intercepts the prompt, checks the proposed changes against the baked-in ruleset, and triggers a visible Warning Gate if a violation is detected.
+- Claude: `--dangerously-skip-permissions --permission-mode bypassPermissions`
+- Codex: `--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check`
+- Gemini: `--skip-trust --approval-mode yolo`
+- Grok: `--always-approve --permission-mode bypassPermissions`
 
-### 5. Secure Path and Directory Harnessing
-Minimal CLI tools are vulnerable to shell injections or path traversal bugs. nTropy enforces absolute workspace locking:
-*   Blocks all absolute paths or parent-directory climbing (`..`) in indexers and skills engines.
-*   Converts all Windows command line execution fallbacks to structured argument slices (`std::process::Command::args`), completely neutralizing command injection vectors.
+The backend sets the child process current directory to the active workspace. That is useful for context and relative paths, but it is not an operating-system sandbox. A launched CLI may still be able to read, write, delete, run commands, use the network, or access credentials according to the normal permissions of the user account and the CLI itself.
 
----
+Use nTropy only with folders and accounts where this level of automation is acceptable.
 
-## 🛠️ Key Capabilities
+## Prerequisites
 
-*   **Tree-Sitter Symbol Indexer:** Parses Rust, Python, JavaScript, and TypeScript files out-of-the-box to extract structures, impl blocks, functions, methods, classes, and interfaces.
-*   **Active Directory Locking:** Locks all child subprocess runs strictly within the designated workspace root directory.
-*   **Multi-Chat Conversations:** Organize project-specific development threads, with isolated chat histories stored locally.
-*   **Continuous Verification Scheduler:** Define periodic validation scripts (e.g., `cargo check`, `npm run test`) to execute in the background on minute, hour, or daily schedules.
-*   **Real-time Process Streams:** Background Rust threads continuously capture `stdout` and `stderr` streams, delivering terminal logs to the frontend via event emitters.
+Install the local app dependencies:
 
----
-
-## 📂 Architecture and How It Works
-
-```mermaid
-graph TD
-    User([User Prompt]) --> Gate{Rules Gate}
-    Gate -->|Violations Warning| UI[Svelte 5 UI]
-    Gate -->|Passed Rules| Orch[Intent Orchestrator]
-    
-    Orch -->|Research Intent| Grok[Grok CLI]
-    Orch -->|Backend Logic| Codex[Codex CLI]
-    Orch -->|UI / Styling| Claude[Claude CLI]
-    Orch -->|Safety / Tests| Gemini[Gemini CLI]
-    
-    subgraph Rust Tauri Sandbox
-        Grok & Codex & Claude & Gemini --> Proc[Sandboxed CLI Process]
-        Proc -->|Intercept stdout / SPAWN_SUBAGENT| Sub[Spawn Subagent]
-        Proc -->|Path & Command Validation| File[Workspace File System]
-    end
-    
-    File -->|Tree-Sitter Indexing| Sym[Symbol Indexer]
-    File -->|Skill Distillation| DZL[Double-Zero Learning Memory]
+```powershell
+npm install
 ```
 
-### Behind the Scenes:
-1.  **Prompt Entry:** The user inputs a prompt into the Svelte UI.
-2.  **Rules Verification:** The frontend calls `check_rules_action` to query Tauri's built-in `RulesEngine` to ensure the prompt doesn't violate any baked-in architectural and engineering rules.
-3.  **Dynamic Routing:** The `CliMediator` parses the prompt to match keywords or model tags, selecting the target model and active directory harness.
-4.  **CLI Spawning & Harnessing:** A dedicated subprocess is spawned in Rust. Standard input is written, and standard output/error is read byte-by-byte in real-time background threads to prevent UI locking.
-5.  **Output Parsing & Interception:** The stdout stream is scanned line-by-line. If `SPAWN_SUBAGENT:` is captured, a Tauri event is dispatched, Svelte registers the new subagent, and it starts working.
-6.  **Progressive Disclosure:** When a skill is triggered (phrase matching), the Level 0 metadata points the LLM to request the full Level 1 specification, maintaining a clean context window.
+Install and authenticate any provider CLI you plan to use:
 
----
+- Claude Code CLI, available as `claude`
+- Gemini CLI, available as `gemini`
+- Grok CLI, available as `grok`
+- Codex CLI, available as `codex`
 
-## 🎛️ Svelte UI Controls Explained
+On Windows, the backend uses shell-free executable launches. It does not route prompt text through `cmd /C`. If a provider fails to launch, confirm the CLI is installed, authenticated, available through its native executable or Node entrypoint, and allowed to run in non-interactive mode.
 
-The nTropy visual workspace is clean, modern, and information-rich, divided into four main sections:
+## Running
 
-1.  **File Explorer & Symbol Navigator (Left Sidebar):**
-    *   Lists the active project's file structure.
-    *   Selecting a code file (`.rs`, `.py`, `.js`, `.ts`) triggers the **Tree-Sitter Indexer**, immediately displaying parsed structures, impl blocks, functions, and line numbers. Clicking a symbol highlights it.
-2.  **Main Interactive Panel (Center):**
-    *   **Chat View:** Houses active project-specific conversation threads. Shows color-coded source markers (e.g. `[ORCHESTRATOR]` routing notes, `[RULES GATE]` alerts, or stream outputs).
-    *   **Tasks View:** The central panel for configuring background recurring verification cycles. Users can add a verification command, assign the model to run it, and select the cron interval (`1m`, `5m`, `30m`, `1h`, `1d`, or `once`).
-3.  **Active Companion Subagents Panel (Right Panel - Tab 1):**
-    *   Displays all active subagents spawned for this workspace, listing their specific roles, model engines, and cost tracking.
-4.  **Double-Zero Skill Book & Active Rules Manifest (Right Panel - Tabs 2 & 3):**
-    *   **Skills:** Review all distilled procedural skills saved in `.agents/skills/`. Click a skill to load the Level 1 detailed markdown specification.
-    *   **Rules:** Displays the active non-negotiables baked directly inside the application, showing their severity, triggers, and active status.
+Frontend only:
 
----
+```powershell
+npm run dev
+```
 
-## 🚦 What to Expect During Runtime
+Tauri desktop app:
 
-*   **Subtle, Premium Styling:** Built using customized dark-mode themes, rounded cards, fluid animations, and clear terminal streams.
-*   **Terminal Logs:** The bottom drawer contains real-time diagnostic logs (`[STDOUT]`, `[STDERR]`) indicating what the CLI processes are executing behind the scenes.
-*   **Baked-in System Rules:** The system ruleset is fully compiled and baked directly into the Tauri binary, ensuring maximum portability, security, and consistent execution across workspaces, without depending on external desktop assets.
-*   **Zero Compile Errors:** nTropy is fully compiled and type-checked on both Svelte 5 and Rust backend configurations, providing a fast, warning-free native desktop container.
+```powershell
+npm run tauri dev
+```
+
+Build frontend assets:
+
+```powershell
+npm run build
+```
+
+Run Svelte checks:
+
+```powershell
+npm run check
+```
+
+The Vite dev server is configured for port `1420` with `strictPort: true` because Tauri points at `http://localhost:1420`.
+
+## Model Routing
+
+Every prompt has an active provider selected in the UI. The backend then applies simple routing rules:
+
+- A prompt starting with `@claude`, `@gemini`, `@grok`, or `@codex` routes to that provider.
+- Prompts mentioning `research agent` or `researcher` route to the research mapping, defaulting to Grok.
+- Prompts mentioning `backend coder agent` or `backend coder` route to the backend mapping, defaulting to Codex.
+- Prompts mentioning `frontend coder agent` or `frontend coder` route to the frontend mapping, defaulting to Claude.
+- Prompts mentioning `verification agent` or `verifier` route to the verification mapping, defaulting to Gemini.
+- Otherwise, the selected UI provider is used.
+
+Provider mappings and specific model selections are passed from the UI into the backend. The UI offers preset model names, but availability still depends on the installed CLI version, account access, and provider-side support.
+
+For Codex child processes, nTropy also passes `--ignore-user-config --disable plugins --disable remote_plugin --disable shell_snapshot`. Auth still comes from the normal Codex login, but spawned runs do not inherit remote MCP/plugin OAuth configuration from the user's global Codex config. That keeps nTropy runs focused on the selected provider/model instead of trying to warm unrelated Codex-owned connectors.
+
+## Subagent Behavior
+
+The companion agents are canonical roles, not arbitrary hidden workers:
+
+- `research`
+- `backend`
+- `frontend`
+- `verification`
+
+The backend instructs the active CLI to delegate by printing a line in this shape:
+
+```text
+SPAWN_SUBAGENT:agent=<research|backend|frontend|verification>,task=<specific task>
+```
+
+Only the top-level chat orchestrator session is allowed to create these companion runs. Casual chat can be answered directly by the orchestrator. Non-casual work, including builds, code changes, project inspection, debugging, tests, model routing issues, logs, auth failures, and research, is mandatory-delegation work. When the backend sees a `SPAWN_SUBAGENT` line in stdout from the main session, it emits a Tauri event tied to that prompt's run id. The frontend also deterministically launches the relevant canonical agents for non-casual prompts, so delegation does not depend only on the model choosing to print the line.
+
+Worker sessions receive a different harness: they are told to complete their assigned slice and not print `SPAWN_SUBAGENT`. If a worker or scheduled task still prints a spawn line, the backend ignores it and logs that nested delegation is disabled. The frontend also rejects spawn events that are missing a parent session id, have a stale run id, or do not come from the live main session. This keeps one user request from turning into recursive fan-out.
+
+Important limitations:
+
+- Invented agent names are ignored.
+- Nested subagent spawning is ignored; the main orchestrator is the only coordinator.
+- The frontend must be running to receive the event and launch the companion run.
+- Subagents use the same full-permission CLI execution model as normal prompts.
+- Delegation can increase token usage and tool activity quickly, so nTropy limits automatic fan-out to one live run per canonical role.
+
+## Project Storage
+
+When a project is opened or created, nTropy ensures the project has a `.agents` directory and opens:
+
+```text
+.agents/nentropy.db
+```
+
+SQLite WAL mode also creates sidecar files such as:
+
+```text
+.agents/nentropy.db-shm
+.agents/nentropy.db-wal
+```
+
+The database stores:
+
+- Chat sessions and messages.
+- Task definitions and status.
+- Skill definitions and trigger tags.
+- Migration history.
+
+The database is local runtime state and may contain prompt text, model output, command output, file paths, and other sensitive information. It is intentionally ignored by git. Do not commit it unless you have deliberately scrubbed and reviewed the contents.
+
+A `.agents/skills` folder may exist in older or manually managed workspaces, but current app skill storage is backed by the SQLite database.
+
+## Rules, Indexing, and Tasks
+
+The rules engine currently ships with a baked-in Human Code Rules manifest. In the UI, rule checks can add warning log entries before a prompt runs. They are useful reminders, not a substitute for review, tests, permissions, or source control.
+
+The file indexer walks the active project and skips common runtime folders such as `.git`, `node_modules`, `.svelte-kit`, `target`, `.vscode`, and `.agents`. Symbol extraction is currently aimed at source navigation, not security enforcement.
+
+Tasks are stored in SQLite and can be run manually or on intervals such as `1m`, `5m`, `30m`, `1h`, `1d`, or `once`. Interval execution depends on the desktop app staying open.
+
+## Operational Safety
+
+Recommended working habits:
+
+- Run nTropy on a disposable branch or throwaway worktree when exploring.
+- Keep secrets, production credentials, and unrelated personal files out of the active workspace.
+- Review `git status` and `git diff` before and after every automation run.
+- Prefer narrowly scoped prompts that name allowed files and forbidden areas.
+- Keep provider CLI auth scoped to accounts and projects where automated local execution is acceptable.
+- Back up important work before running broad refactors or scheduled tasks.
+- Stop the active session from the UI or terminate the app if a CLI begins acting outside the intended scope.
+
+The safest assumption is that a launched provider CLI can do anything you could do in that shell.
+
+## Development Notes
+
+Primary app files:
+
+- `src/routes/+page.svelte` contains the desktop UI.
+- `src-tauri/src/lib.rs` registers Tauri commands and project database switching.
+- `src-tauri/src/cli_mediator.rs` handles provider routing and child process launch.
+- `src-tauri/src/db` contains SQLite schema and queries.
+- `src-tauri/src/rules_engine.rs` contains the built-in advisory rules manifest.
+- `src-tauri/src/symbol_indexer.rs` contains workspace file indexing and Tree-sitter symbol extraction.
+
+Useful checks:
+
+```powershell
+npm run check
+npm run build
+cd src-tauri
+cargo check
+```

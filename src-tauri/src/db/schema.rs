@@ -12,11 +12,10 @@ pub struct Migration {
     pub sql: &'static str,
 }
 
-pub const MIGRATIONS: &[Migration] = &[
-    Migration {
-        version: 1,
-        description: "initialize database schema",
-        sql: r#"
+pub const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    description: "initialize database schema",
+    sql: r#"
 CREATE TABLE sessions (
     id          TEXT PRIMARY KEY,
     title       TEXT NOT NULL,
@@ -55,5 +54,4 @@ CREATE INDEX idx_messages_session ON messages(session_id, created_at);
 CREATE INDEX idx_tasks_session ON tasks(session_id, created_at);
 CREATE INDEX idx_skills_name ON skills(name);
         "#,
-    }
-];
+}];

@@ -43,10 +43,16 @@ impl Database {
         Ok(Self { writer, reader })
     }
 
-    fn run_migrations(conn: &async_sqlite::rusqlite::Connection) -> Result<(), async_sqlite::rusqlite::Error> {
+    fn run_migrations(
+        conn: &async_sqlite::rusqlite::Connection,
+    ) -> Result<(), async_sqlite::rusqlite::Error> {
         conn.execute_batch(schema::MIGRATIONS_TABLE)?;
         let current_version: i64 = conn
-            .query_row("SELECT COALESCE(MAX(version), 0) FROM schema_versions", [], |row| row.get(0))
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_versions",
+                [],
+                |row| row.get(0),
+            )
             .unwrap_or(0);
 
         for migration in schema::MIGRATIONS {
@@ -109,7 +115,10 @@ impl Database {
     pub async fn delete_session(&self, id: String) -> Result<(), String> {
         self.writer
             .conn(move |conn| {
-                conn.execute("DELETE FROM sessions WHERE id = ?1", async_sqlite::rusqlite::params![id])?;
+                conn.execute(
+                    "DELETE FROM sessions WHERE id = ?1",
+                    async_sqlite::rusqlite::params![id],
+                )?;
                 Ok(())
             })
             .await
@@ -118,7 +127,10 @@ impl Database {
 
     // --- Message CRUD Queries ---
 
-    pub async fn get_session_messages(&self, session_id: String) -> Result<Vec<(String, String, String)>, String> {
+    pub async fn get_session_messages(
+        &self,
+        session_id: String,
+    ) -> Result<Vec<(String, String, String)>, String> {
         self.reader
             .conn(move |conn| {
                 let mut stmt = conn.prepare("SELECT role, content, created_at FROM messages WHERE session_id = ?1 ORDER BY created_at ASC")?;
@@ -139,7 +151,12 @@ impl Database {
             .map_err(|e| format!("get_session_messages failed: {}", e))
     }
 
-    pub async fn add_session_message(&self, session_id: String, role: String, content: String) -> Result<(), String> {
+    pub async fn add_session_message(
+        &self,
+        session_id: String,
+        role: String,
+        content: String,
+    ) -> Result<i64, String> {
         let now = chrono::Utc::now().to_rfc3339();
         self.writer
             .conn(move |conn| {
@@ -147,7 +164,31 @@ impl Database {
                     "INSERT INTO messages (session_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)",
                     async_sqlite::rusqlite::params![session_id, role, content, now],
                 )?;
+                let id = conn.last_insert_rowid();
                 // Update updated_at of the session
+                conn.execute(
+                    "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+                    async_sqlite::rusqlite::params![now, session_id],
+                )?;
+                Ok(id)
+            })
+            .await
+            .map_err(|e| format!("add_session_message failed: {}", e))
+    }
+
+    pub async fn update_session_message(&self, id: i64, content: String) -> Result<(), String> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.writer
+            .conn(move |conn| {
+                let session_id: String = conn.query_row(
+                    "SELECT session_id FROM messages WHERE id = ?1",
+                    async_sqlite::rusqlite::params![id],
+                    |row| row.get(0),
+                )?;
+                conn.execute(
+                    "UPDATE messages SET content = ?1 WHERE id = ?2",
+                    async_sqlite::rusqlite::params![content, id],
+                )?;
                 conn.execute(
                     "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
                     async_sqlite::rusqlite::params![now, session_id],
@@ -155,12 +196,14 @@ impl Database {
                 Ok(())
             })
             .await
-            .map_err(|e| format!("add_session_message failed: {}", e))
+            .map_err(|e| format!("update_session_message failed: {}", e))
     }
 
     // --- Task CRUD Queries ---
 
-    pub async fn get_all_tasks(&self) -> Result<Vec<(String, String, String, String, String, String)>, String> {
+    pub async fn get_all_tasks(
+        &self,
+    ) -> Result<Vec<(String, String, String, String, String, String)>, String> {
         self.reader
             .conn(|conn| {
                 let mut stmt = conn.prepare("SELECT id, session_id, text, status, created_at, updated_at FROM tasks ORDER BY created_at ASC")?;
@@ -184,7 +227,12 @@ impl Database {
             .map_err(|e| format!("get_all_tasks failed: {}", e))
     }
 
-    pub async fn create_task(&self, id: String, session_id: String, text: String) -> Result<(), String> {
+    pub async fn create_task(
+        &self,
+        id: String,
+        session_id: String,
+        text: String,
+    ) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
         self.writer
             .conn(move |conn| {
@@ -215,7 +263,10 @@ impl Database {
     pub async fn delete_task(&self, id: String) -> Result<(), String> {
         self.writer
             .conn(move |conn| {
-                conn.execute("DELETE FROM tasks WHERE id = ?1", async_sqlite::rusqlite::params![id])?;
+                conn.execute(
+                    "DELETE FROM tasks WHERE id = ?1",
+                    async_sqlite::rusqlite::params![id],
+                )?;
                 Ok(())
             })
             .await
@@ -224,7 +275,9 @@ impl Database {
 
     // --- Skills CRUD Queries ---
 
-    pub async fn get_all_skills(&self) -> Result<Vec<(String, String, String, String, bool)>, String> {
+    pub async fn get_all_skills(
+        &self,
+    ) -> Result<Vec<(String, String, String, String, bool)>, String> {
         self.reader
             .conn(|conn| {
                 let mut stmt = conn.prepare("SELECT name, description, trigger_tags, definition, enabled FROM skills ORDER BY name ASC")?;
@@ -275,7 +328,10 @@ impl Database {
     pub async fn delete_skill(&self, name: String) -> Result<(), String> {
         self.writer
             .conn(move |conn| {
-                conn.execute("DELETE FROM skills WHERE name = ?1", async_sqlite::rusqlite::params![name])?;
+                conn.execute(
+                    "DELETE FROM skills WHERE name = ?1",
+                    async_sqlite::rusqlite::params![name],
+                )?;
                 Ok(())
             })
             .await

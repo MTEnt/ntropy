@@ -1,17 +1,39 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::process::{Command, Child, Stdio};
-use std::sync::{Arc, Mutex};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, Mutex,
+};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter};
+use uuid::Uuid;
+
+const MAX_SPAWN_LINE_BUFFER_CHARS: usize = 16 * 1024;
+const MAX_SPAWN_TASK_CHARS: usize = 2048;
+const MAIN_SESSION_ID: &str = "active-workspace-session";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptRequest {
     pub session_id: String,
+    pub run_id: Option<String>,
     pub model: String, // "claude", "gemini", "grok", "codex"
+    pub specific_model: Option<String>,
     pub prompt: String,
     pub agent_mappings: Option<HashMap<String, String>>,
     pub provider_models: Option<HashMap<String, String>>,
+    pub subagent_models: Option<HashMap<String, AgentModelSelection>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelSelection {
+    pub name: String,
+    pub role: String,
+    pub provider: String,
+    pub specific_model: String,
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,8 +43,17 @@ pub struct ProcessOutputEvent {
     pub data: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CliFinishedEvent {
+    pub session_id: String,
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub message: String,
+}
+
 pub struct CliSession {
-    pub child: Child,
+    pub child: Arc<Mutex<Child>>,
+    pub finish_on_exit: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -37,32 +68,72 @@ impl CliMediator {
         }
     }
 
-    pub fn send_prompt(&self, app: AppHandle, req: PromptRequest, workspace_root: std::path::PathBuf) -> Result<(), String> {
-        let mut sessions = self.active_sessions.lock().unwrap();
+    pub fn send_prompt(
+        &self,
+        app: AppHandle,
+        req: PromptRequest,
+        workspace_root: std::path::PathBuf,
+    ) -> Result<(), String> {
+        let req = validate_prompt_request(req)?;
         let session_id = req.session_id.clone();
-        
+        let run_id = req
+            .run_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        let routed_agent_key = route_agent_key(&req.prompt);
         let final_model = route_task(&req.prompt, &req.model, req.agent_mappings.as_ref());
-        let mut specific_model = req.provider_models.as_ref()
-            .and_then(|m| m.get(&final_model))
-            .cloned();
-            
+        let mut specific_model =
+            select_specific_model(&req, &final_model, routed_agent_key.as_deref());
+
         if final_model == "claude" {
             if let Some(ref m) = specific_model {
                 specific_model = Some(m.replace(".", "-"));
             }
         }
-            
+
         let cleaned_prompt = clean_prompt(&req.prompt);
-        let prompt_with_harness = format!(
-            "{}\n\n[SYSTEM INSTRUCTION]: You are running in the nTropy workspace environment. You have the capability to dynamically spawn specialized subagents to run concurrent tasks for you. If you choose to spawn subagents, print one or more lines in this exact format (each on its own line):\nSPAWN_SUBAGENT:name=<Name>,role=<Role>,model=<claude|gemini|grok|codex>\nYou can spawn as many subagents as you deem necessary to complete the task.",
-            cleaned_prompt
-        );
-        
+        let allow_subagent_spawns = session_allows_subagent_spawns(&session_id);
+        let prompt_with_harness = if allow_subagent_spawns {
+            let agent_registry = format_agent_registry(
+                req.agent_mappings.as_ref(),
+                req.provider_models.as_ref(),
+                req.subagent_models.as_ref(),
+            );
+            let delegation_policy = if is_casual_chat_prompt(&cleaned_prompt) {
+                "Delegation mode: casual chat.\n- This prompt appears to be a normal conversation. You may answer directly without spawning subagents.\n- If you realize the answer requires research, file inspection, code changes, tests, command execution, or other project work, you MUST delegate to the relevant canonical agents before proceeding."
+            } else {
+                "Delegation mode: mandatory delegation.\n- This prompt is non-casual work. You MUST involve the relevant companion agents by printing SPAWN_SUBAGENT lines for the canonical roles that should own parts of the task.\n- Delegate research/inspection to research, implementation/backend/filesystem work to backend, UI/app styling work to frontend, and checks/tests/validation to verification.\n- Your coordinator response should stay concise and should not replace the assigned workers' slices."
+            };
+            format!(
+                "{}\n\n[SYSTEM INSTRUCTION]: You are running in the nTropy workspace environment. Current backend execution target: provider={} specific_model={}. Available companion subagents are:\n{}\n\nStrict delegation protocol:\n- You are the only nTropy coordinator for this user request.\n- {}\n- Delegate work by printing one line per delegated task in exactly this format, with no commas inside values:\nSPAWN_SUBAGENT:agent=<research|backend|frontend|verification>,task=<specific task>\n- You MUST use only these exact canonical agent keys: research, backend, frontend, verification.\n- Do not invent agent names, alternate labels, provider names, or underlying model names in delegation commands.\n- The nTropy backend will ignore invented labels and resolve the user's selected provider/model from the registry for that exact agent key.",
+                cleaned_prompt,
+                final_model,
+                specific_model.as_deref().unwrap_or("provider-default"),
+                agent_registry,
+                delegation_policy
+            )
+        } else {
+            format!(
+                "{}\n\n[SYSTEM INSTRUCTION]: You are running in the nTropy workspace environment. Current backend execution target: provider={} specific_model={}. This is a worker execution session, not the top-level nTropy coordinator.\n\nDelegation boundary:\n- Nested subagent delegation is disabled for this session.\n- Do not print SPAWN_SUBAGENT commands.\n- Work only on the assigned task and return concise final output for the shared chat.",
+                cleaned_prompt,
+                final_model,
+                specific_model.as_deref().unwrap_or("provider-default")
+            )
+        };
+
         // Terminate any existing running process for this session first
-        if let Some(mut old_session) = sessions.remove(&session_id) {
-            println!("Killing previous running process for session '{}'", session_id);
-            if let Err(e) = old_session.child.kill() {
-                println!("Warning: Failed to terminate previous running process for session '{}' (process may have already terminated): {}", session_id, e);
+        {
+            let mut sessions = self.active_sessions.lock().unwrap();
+            if let Some(old_session) = sessions.remove(&session_id) {
+                old_session.finish_on_exit.store(false, Ordering::SeqCst);
+                println!(
+                    "Killing previous running process for session '{}'",
+                    session_id
+                );
+                if let Err(e) = terminate_child_process(&old_session.child, &session_id) {
+                    println!("Warning: Failed to terminate previous running process for session '{}' (process may have already terminated): {}", session_id, e);
+                }
             }
         }
 
@@ -70,7 +141,7 @@ impl CliMediator {
         let display_model_info = if let Some(ref m) = specific_model {
             format!("{} ({})", final_model.to_uppercase(), m)
         } else {
-            final_model.to_uppercase()
+            format!("{} (provider-default)", final_model.to_uppercase())
         };
 
         let _ = app.emit("cli-output", ProcessOutputEvent {
@@ -83,22 +154,43 @@ impl CliMediator {
             ),
         });
 
-        println!("Spawning new CLI process for model '{}' in session '{}' inside directory {:?}", final_model, session_id, workspace_root);
+        let _ = app.emit(
+            "cli-output",
+            ProcessOutputEvent {
+                session_id: session_id.clone(),
+                stream: "stdout".to_string(),
+                data: format!(
+                "[ORCHESTRATOR] Exact backend model selection: provider={} specific_model={}\n\n",
+                final_model,
+                specific_model.as_deref().unwrap_or("provider-default")
+            ),
+            },
+        );
+
+        println!(
+            "Spawning new CLI process for model '{}' in session '{}' inside directory {:?}",
+            final_model, session_id, workspace_root
+        );
 
         let mut child = if cfg!(target_os = "windows") {
             let mut spawned = None;
-            
+
             // Try spawning direct native executable first to bypass cmd.exe and avoid escaping bugs
             match final_model.as_str() {
                 "claude" => {
                     let direct_path = r"C:\Users\User\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe";
                     let mut cmd = Command::new(direct_path);
                     cmd.current_dir(&workspace_root)
-                       .stdin(Stdio::piped())
-                       .stdout(Stdio::piped())
-                       .stderr(Stdio::piped());
-                    
-                    let mut args = vec!["--print", "--dangerously-skip-permissions"];
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped());
+
+                    let mut args = vec![
+                        "--print",
+                        "--dangerously-skip-permissions",
+                        "--permission-mode",
+                        "bypassPermissions",
+                    ];
                     if let Some(ref m) = specific_model {
                         args.push("--model");
                         args.push(m);
@@ -116,11 +208,12 @@ impl CliMediator {
                     let direct_path = r"C:\Users\User\.grok\bin\grok.exe";
                     let mut cmd = Command::new(direct_path);
                     cmd.current_dir(&workspace_root)
-                       .stdin(Stdio::piped())
-                       .stdout(Stdio::piped())
-                       .stderr(Stdio::piped());
-                    
-                    let mut args = Vec::new();
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped());
+
+                    let mut args =
+                        vec!["--always-approve", "--permission-mode", "bypassPermissions"];
                     if let Some(ref m) = specific_model {
                         args.push("-m");
                         args.push(m);
@@ -140,61 +233,96 @@ impl CliMediator {
                     let direct_path = r"C:\Users\User\AppData\Roaming\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\codex\codex.exe";
                     let mut cmd = Command::new(direct_path);
                     cmd.current_dir(&workspace_root)
-                       .stdin(Stdio::piped())
-                       .stdout(Stdio::piped())
-                       .stderr(Stdio::piped());
-                       
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped());
+
                     if let Some(ref m) = specific_model {
                         cmd.env("OPENAI_MODEL", m);
                         cmd.env("LLM_MODEL", m);
                     }
-                    
-                    // Try to resume the last session
-                    let mut args = vec!["exec"];
+
+                    let mut args = vec![
+                        "exec",
+                        "--ignore-user-config",
+                        "--disable",
+                        "plugins",
+                        "--disable",
+                        "remote_plugin",
+                        "--disable",
+                        "shell_snapshot",
+                        "-c",
+                        "model_reasoning_effort=\"xhigh\"",
+                    ];
                     if let Some(ref m) = specific_model {
                         args.push("--model");
                         args.push(m);
                     }
-                    
-                    let mut resume_args = args.clone();
-                    resume_args.push("resume");
-                    resume_args.push("--last");
-                    resume_args.push("--skip-git-repo-check");
-                    resume_args.push("-");
-                    
-                    let mut fallback_args = args.clone();
-                    fallback_args.push("--skip-git-repo-check");
-                    fallback_args.push("-");
-                    
-                    if let Ok(c) = cmd.args(&resume_args).spawn() {
-                        println!("Direct codex.exe (resume last) spawned successfully.");
+                    args.push("--skip-git-repo-check");
+                    args.push("--dangerously-bypass-approvals-and-sandbox");
+                    args.push("-");
+
+                    if let Ok(c) = cmd.args(&args).spawn() {
+                        println!("Direct codex.exe spawned successfully with full permissions.");
                         spawned = Some(c);
-                    } else {
-                        let mut cmd2 = Command::new(direct_path);
-                        cmd2.current_dir(&workspace_root)
-                           .stdin(Stdio::piped())
-                           .stdout(Stdio::piped())
-                           .stderr(Stdio::piped());
-                        if let Some(ref m) = specific_model {
-                            cmd2.env("OPENAI_MODEL", m);
-                            cmd2.env("LLM_MODEL", m);
-                        }
-                        if let Ok(c) = cmd2.args(&fallback_args).spawn() {
-                            println!("Direct codex.exe spawned successfully.");
-                            spawned = Some(c);
-                        }
+                    }
+                }
+                "gemini" => {
+                    let script_path = r"C:\Users\User\AppData\Roaming\npm\node_modules\@google\gemini-cli\bundle\gemini.js";
+                    let mut cmd = Command::new("node");
+                    cmd.current_dir(&workspace_root)
+                        .arg(script_path)
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped());
+
+                    if let Some(ref m) = specific_model {
+                        cmd.env("GEMINI_MODEL", m);
+                        cmd.env("LLM_MODEL", m);
+                    }
+
+                    let mut args = vec!["--skip-trust", "--approval-mode", "yolo"];
+                    if let Some(ref m) = specific_model {
+                        args.push("--model");
+                        args.push(m);
+                    }
+                    args.push("--prompt");
+                    args.push(&prompt_with_harness);
+                    cmd.args(&args);
+
+                    if let Ok(c) = cmd.spawn() {
+                        println!("Direct gemini node entrypoint spawned successfully.");
+                        spawned = Some(c);
                     }
                 }
                 _ => {}
             }
 
-            // Fallback to cmd /C if direct native spawn failed or for other models
+            // Shell-free fallback. Never route prompt text through cmd.exe.
             if spawned.is_none() {
-                println!("Falling back to cmd /C for model: {}", final_model);
-                let mut cmd = Command::new("cmd");
+                println!(
+                    "Falling back to shell-free executable spawn for model: {}",
+                    final_model
+                );
+                let mut cmd = match final_model.as_str() {
+                    "claude" => Command::new(
+                        r"C:\Users\User\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe",
+                    ),
+                    "grok" => Command::new(r"C:\Users\User\.grok\bin\grok.exe"),
+                    "codex" => Command::new(
+                        r"C:\Users\User\AppData\Roaming\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\codex\codex.exe",
+                    ),
+                    "gemini" => {
+                        let mut node_cmd = Command::new("node");
+                        node_cmd.arg(r"C:\Users\User\AppData\Roaming\npm\node_modules\@google\gemini-cli\bundle\gemini.js");
+                        node_cmd
+                    }
+                    _ => {
+                        return Err(format!("Unsupported model/CLI: {}", final_model));
+                    }
+                };
                 cmd.current_dir(&workspace_root);
-                cmd.arg("/C");
-                
+
                 if let Some(ref m) = specific_model {
                     cmd.env("CLAUDE_MODEL", m);
                     cmd.env("GEMINI_MODEL", m);
@@ -202,10 +330,15 @@ impl CliMediator {
                     cmd.env("OPENAI_MODEL", m);
                     cmd.env("LLM_MODEL", m);
                 }
-                
+
                 match final_model.as_str() {
                     "claude" => {
-                        let mut args = vec!["claude", "--print", "--dangerously-skip-permissions"];
+                        let mut args = vec![
+                            "--print",
+                            "--dangerously-skip-permissions",
+                            "--permission-mode",
+                            "bypassPermissions",
+                        ];
                         if let Some(ref m) = specific_model {
                             args.push("--model");
                             args.push(m);
@@ -213,7 +346,8 @@ impl CliMediator {
                         cmd.args(&args);
                     }
                     "grok" => {
-                        let mut args = vec!["grok"];
+                        let mut args =
+                            vec!["--always-approve", "--permission-mode", "bypassPermissions"];
                         if let Some(ref m) = specific_model {
                             args.push("-m");
                             args.push(m);
@@ -223,20 +357,35 @@ impl CliMediator {
                         cmd.args(&args);
                     }
                     "codex" => {
-                        let mut args = vec!["codex", "exec", "resume", "--last", "--skip-git-repo-check"];
+                        let mut args = vec![
+                            "exec",
+                            "--ignore-user-config",
+                            "--disable",
+                            "plugins",
+                            "--disable",
+                            "remote_plugin",
+                            "--disable",
+                            "shell_snapshot",
+                            "-c",
+                            "model_reasoning_effort=\"xhigh\"",
+                            "--skip-git-repo-check",
+                            "--dangerously-bypass-approvals-and-sandbox",
+                        ];
                         if let Some(ref m) = specific_model {
                             args.push("--model");
                             args.push(m);
                         }
-                        args.push(&prompt_with_harness);
+                        args.push("-");
                         cmd.args(&args);
                     }
                     "gemini" => {
-                        let mut args = vec!["gemini"];
+                        let mut args = vec!["--skip-trust", "--approval-mode", "yolo"];
                         if let Some(ref m) = specific_model {
                             args.push("--model");
                             args.push(m);
                         }
+                        args.push("--prompt");
+                        args.push(&prompt_with_harness);
                         cmd.args(&args);
                     }
                     _ => {
@@ -244,10 +393,10 @@ impl CliMediator {
                     }
                 }
                 cmd.stdin(Stdio::piped())
-                   .stdout(Stdio::piped())
-                   .stderr(Stdio::piped())
-                   .spawn()
-                   .map_err(|e| format!("Failed to spawn cmd fallback: {}", e))?
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(|e| format!("Failed to spawn shell-free fallback: {}", e))?
             } else {
                 spawned.unwrap()
             }
@@ -261,7 +410,7 @@ impl CliMediator {
                 _ => return Err(format!("Unsupported model/CLI: {}", final_model)),
             });
             cmd.current_dir(&workspace_root);
-            
+
             if let Some(ref m) = specific_model {
                 cmd.env("CLAUDE_MODEL", m);
                 cmd.env("GEMINI_MODEL", m);
@@ -272,7 +421,12 @@ impl CliMediator {
 
             match final_model.as_str() {
                 "claude" => {
-                    let mut args = vec!["--print", "--dangerously-skip-permissions"];
+                    let mut args = vec![
+                        "--print",
+                        "--dangerously-skip-permissions",
+                        "--permission-mode",
+                        "bypassPermissions",
+                    ];
                     if let Some(ref m) = specific_model {
                         args.push("--model");
                         args.push(m);
@@ -280,7 +434,8 @@ impl CliMediator {
                     cmd.args(&args);
                 }
                 "grok" => {
-                    let mut args = Vec::new();
+                    let mut args =
+                        vec!["--always-approve", "--permission-mode", "bypassPermissions"];
                     if let Some(ref m) = specific_model {
                         args.push("-m");
                         args.push(m);
@@ -290,7 +445,20 @@ impl CliMediator {
                     cmd.args(&args);
                 }
                 "codex" => {
-                    let mut args = vec!["exec", "resume", "--last", "--skip-git-repo-check"];
+                    let mut args = vec![
+                        "exec",
+                        "--ignore-user-config",
+                        "--disable",
+                        "plugins",
+                        "--disable",
+                        "remote_plugin",
+                        "--disable",
+                        "shell_snapshot",
+                        "-c",
+                        "model_reasoning_effort=\"xhigh\"",
+                        "--skip-git-repo-check",
+                        "--dangerously-bypass-approvals-and-sandbox",
+                    ];
                     if let Some(ref m) = specific_model {
                         args.push("--model");
                         args.push(m);
@@ -299,25 +467,27 @@ impl CliMediator {
                     cmd.args(&args);
                 }
                 "gemini" => {
-                    let mut args = Vec::new();
+                    let mut args = vec!["--skip-trust", "--approval-mode", "yolo"];
                     if let Some(ref m) = specific_model {
                         args.push("--model");
                         args.push(m);
                     }
+                    args.push("--prompt");
+                    args.push(&prompt_with_harness);
                     cmd.args(&args);
                 }
                 _ => {}
             }
             cmd.stdin(Stdio::piped())
-               .stdout(Stdio::piped())
-               .stderr(Stdio::piped())
-               .spawn()
-               .map_err(|e| format!("Failed to spawn CLI: {}", e))?
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("Failed to spawn CLI: {}", e))?
         };
 
         // If stdin is piped, write the prompt to it and immediately close it
         if let Some(mut stdin) = child.stdin.take() {
-            if final_model == "claude" || final_model == "codex" || final_model == "gemini" {
+            if final_model == "claude" || final_model == "codex" {
                 let mut prompt_bytes = prompt_with_harness.as_bytes().to_vec();
                 prompt_bytes.push(b'\n');
                 let _ = stdin.write_all(&prompt_bytes);
@@ -329,50 +499,114 @@ impl CliMediator {
 
         let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
         let stderr = child.stderr.take().ok_or("Failed to capture stderr")?;
+        let child_handle = Arc::new(Mutex::new(child));
+        let finish_on_exit = Arc::new(AtomicBool::new(true));
+        let (stdout_done_tx, stdout_done_rx) = mpsc::channel();
+        let (stderr_done_tx, stderr_done_rx) = mpsc::channel();
 
         // Spawn background threads to continuously read stdout and stderr chunk-by-chunk in real-time
         let app_stdout = app.clone();
         let session_id_stdout = session_id.clone();
+        let run_id_stdout = run_id.clone();
         std::thread::spawn(move || {
             let mut reader = stdout;
             let mut buf = [0u8; 1024];
             let mut line_buffer = String::new();
-            
+
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break, // EOF
                     Ok(n) => {
                         let chunk_str = String::from_utf8_lossy(&buf[..n]).to_string();
-                        
-                        let _ = app_stdout.emit("cli-output", ProcessOutputEvent {
-                            session_id: session_id_stdout.clone(),
-                            stream: "stdout".to_string(),
-                            data: chunk_str.clone(),
-                        });
+
+                        let _ = app_stdout.emit(
+                            "cli-output",
+                            ProcessOutputEvent {
+                                session_id: session_id_stdout.clone(),
+                                stream: "stdout".to_string(),
+                                data: chunk_str.clone(),
+                            },
+                        );
 
                         // Accumulate line_buffer for SPAWN_SUBAGENT detection
                         line_buffer.push_str(&chunk_str);
+                        if line_buffer.len() > MAX_SPAWN_LINE_BUFFER_CHARS {
+                            let char_count = line_buffer.chars().count();
+                            line_buffer = line_buffer
+                                .chars()
+                                .skip(char_count.saturating_sub(MAX_SPAWN_LINE_BUFFER_CHARS))
+                                .collect();
+                            if let Some(pos) = line_buffer.find('\n') {
+                                line_buffer = line_buffer[pos + 1..].to_string();
+                            }
+                        }
                         while let Some(pos) = line_buffer.find('\n') {
                             let line = line_buffer[..pos].trim_end().to_string();
                             line_buffer = line_buffer[pos + 1..].to_string();
-                            
-                            if line.contains("SPAWN_SUBAGENT:") {
-                                if let Some(spawn_req) = parse_spawn_command(&line) {
-                                    println!("Dynamic Subagent Spawn Request intercepted: {:?}", spawn_req);
+
+                            if let Some(spawn_req) =
+                                parse_spawn_command(&line, &session_id_stdout, &run_id_stdout)
+                            {
+                                if session_allows_subagent_spawns(&session_id_stdout) {
+                                    println!(
+                                        "Dynamic Subagent Spawn Request intercepted: {:?}",
+                                        spawn_req
+                                    );
                                     let _ = app_stdout.emit("spawn-subagent", spawn_req);
+                                } else {
+                                    let _ = app_stdout.emit(
+                                        "cli-output",
+                                        ProcessOutputEvent {
+                                            session_id: session_id_stdout.clone(),
+                                            stream: "stdout".to_string(),
+                                            data: format!(
+                                                "[ORCHESTRATOR] Ignored nested SPAWN_SUBAGENT from {}; only the main orchestrator session may spawn subagents.\n",
+                                                session_id_stdout
+                                            ),
+                                        },
+                                    );
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("[ERROR] Failed to read stdout stream chunk for session '{}': {}", session_id_stdout, e);
+                        eprintln!(
+                            "[ERROR] Failed to read stdout stream chunk for session '{}': {}",
+                            session_id_stdout, e
+                        );
                         break;
                     }
                 }
             }
-            
-            // Signal to frontend that the CLI run is complete
-            let _ = app_stdout.emit("cli-finished", session_id_stdout);
+
+            if !line_buffer.is_empty() {
+                let line = line_buffer.trim_end().to_string();
+                if let Some(spawn_req) =
+                    parse_spawn_command(&line, &session_id_stdout, &run_id_stdout)
+                {
+                    if session_allows_subagent_spawns(&session_id_stdout) {
+                        println!(
+                            "Dynamic Subagent Spawn Request intercepted: {:?}",
+                            spawn_req
+                        );
+                        let _ = app_stdout.emit("spawn-subagent", spawn_req);
+                    } else {
+                        let _ = app_stdout.emit(
+                            "cli-output",
+                            ProcessOutputEvent {
+                                session_id: session_id_stdout.clone(),
+                                stream: "stdout".to_string(),
+                                data: format!(
+                                    "[ORCHESTRATOR] Ignored nested SPAWN_SUBAGENT from {}; only the main orchestrator session may spawn subagents.\n",
+                                    session_id_stdout
+                                ),
+                            },
+                        );
+                    }
+                }
+            }
+
+            let _ = stdout_done_tx.send(());
         });
 
         let app_stderr = app.clone();
@@ -385,79 +619,660 @@ impl CliMediator {
                     Ok(0) => break, // EOF
                     Ok(n) => {
                         let chunk_str = String::from_utf8_lossy(&buf[..n]).to_string();
-                        let _ = app_stderr.emit("cli-output", ProcessOutputEvent {
-                            session_id: session_id_stderr.clone(),
-                            stream: "stderr".to_string(),
-                            data: chunk_str,
-                        });
+                        let _ = app_stderr.emit(
+                            "cli-output",
+                            ProcessOutputEvent {
+                                session_id: session_id_stderr.clone(),
+                                stream: "stderr".to_string(),
+                                data: chunk_str,
+                            },
+                        );
                     }
                     Err(e) => {
-                        eprintln!("[ERROR] Failed to read stderr stream chunk for session '{}': {}", session_id_stderr, e);
+                        eprintln!(
+                            "[ERROR] Failed to read stderr stream chunk for session '{}': {}",
+                            session_id_stderr, e
+                        );
                         break;
                     }
                 }
             }
+            let _ = stderr_done_tx.send(());
         });
 
-        sessions.insert(session_id, CliSession { child });
+        {
+            let mut sessions = self.active_sessions.lock().unwrap();
+            sessions.insert(
+                session_id.clone(),
+                CliSession {
+                    child: child_handle.clone(),
+                    finish_on_exit: finish_on_exit.clone(),
+                },
+            );
+        }
+
+        let app_finish = app.clone();
+        let session_id_finish = session_id.clone();
+        let active_sessions = self.active_sessions.clone();
+        std::thread::spawn(move || {
+            monitor_child_process(
+                app_finish,
+                session_id_finish,
+                child_handle,
+                active_sessions,
+                finish_on_exit,
+                stdout_done_rx,
+                stderr_done_rx,
+            );
+        });
 
         Ok(())
     }
 
-    pub fn terminate_session(&self, session_id: &str) {
+    pub fn terminate_session(&self, session_id: &str) -> Result<(), String> {
         let mut sessions = self.active_sessions.lock().unwrap();
-        if let Some(mut session) = sessions.remove(session_id) {
+        if let Some(session) = sessions.remove(session_id) {
             println!("Terminating CLI session '{}'", session_id);
-            let _ = session.child.kill();
+            terminate_child_process(&session.child, session_id)
+        } else {
+            Err(format!("No active CLI session found for '{}'", session_id))
         }
+    }
+}
+
+fn monitor_child_process(
+    app: AppHandle,
+    session_id: String,
+    child_handle: Arc<Mutex<Child>>,
+    active_sessions: Arc<Mutex<HashMap<String, CliSession>>>,
+    finish_on_exit: Arc<AtomicBool>,
+    stdout_done_rx: mpsc::Receiver<()>,
+    stderr_done_rx: mpsc::Receiver<()>,
+) {
+    let finished = loop {
+        let wait_result = {
+            let mut child = match child_handle.lock() {
+                Ok(child) => child,
+                Err(_) => {
+                    break CliFinishedEvent {
+                        session_id: session_id.clone(),
+                        success: false,
+                        exit_code: None,
+                        message:
+                            "Failed to observe CLI exit status: child process lock was poisoned"
+                                .to_string(),
+                    };
+                }
+            };
+            child.try_wait()
+        };
+
+        match wait_result {
+            Ok(Some(status)) => break cli_finished_from_status(session_id.clone(), status),
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => {
+                break CliFinishedEvent {
+                    session_id: session_id.clone(),
+                    success: false,
+                    exit_code: None,
+                    message: format!("Failed to observe CLI exit status: {}", e),
+                };
+            }
+        }
+    };
+
+    let _ = stdout_done_rx.recv_timeout(Duration::from_secs(2));
+    let _ = stderr_done_rx.recv_timeout(Duration::from_secs(2));
+
+    {
+        let mut sessions = active_sessions.lock().unwrap();
+        let should_remove = sessions
+            .get(&session_id)
+            .map(|session| Arc::ptr_eq(&session.child, &child_handle))
+            .unwrap_or(false);
+        if should_remove {
+            sessions.remove(&session_id);
+        }
+    }
+
+    if finish_on_exit.load(Ordering::SeqCst) {
+        let _ = app.emit("cli-finished", finished);
+    }
+}
+
+fn cli_finished_from_status(session_id: String, status: ExitStatus) -> CliFinishedEvent {
+    let exit_code = status.code();
+    let success = status.success();
+    let message = if success {
+        "CLI process exited successfully".to_string()
+    } else if let Some(code) = exit_code {
+        format!("CLI process exited with code {}", code)
+    } else {
+        "CLI process terminated without an exit code".to_string()
+    };
+
+    CliFinishedEvent {
+        session_id,
+        success,
+        exit_code,
+        message,
+    }
+}
+
+fn terminate_child_process(
+    child_handle: &Arc<Mutex<Child>>,
+    session_id: &str,
+) -> Result<(), String> {
+    let mut child = child_handle.lock().map_err(|_| {
+        format!(
+            "Failed to terminate CLI session '{}': child process lock was poisoned",
+            session_id
+        )
+    })?;
+
+    match child.try_wait() {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => {
+            if let Err(e) = child.kill() {
+                if child.try_wait().ok().flatten().is_some() {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "Failed to terminate CLI session '{}': {}",
+                    session_id, e
+                ));
+            }
+            child
+                .wait()
+                .map(|_| ())
+                .map_err(|e| format!("Failed to reap CLI session '{}': {}", session_id, e))
+        }
+        Err(e) => Err(format!(
+            "Failed to inspect CLI session '{}': {}",
+            session_id, e
+        )),
+    }
+}
+
+fn validate_prompt_request(mut req: PromptRequest) -> Result<PromptRequest, String> {
+    req.session_id = validate_session_id(&req.session_id)?;
+    req.run_id = Some(match req.run_id.take() {
+        Some(run_id) => validate_run_id(&run_id)?,
+        None => Uuid::new_v4().to_string(),
+    });
+    req.model = normalize_provider(&req.model, "model")?;
+    req.specific_model = match req.specific_model.take() {
+        Some(model) => normalize_optional_model(&req.model, &model, "specific_model")?,
+        None => None,
+    };
+
+    if let Some(agent_mappings) = req.agent_mappings.take() {
+        let mut normalized = HashMap::new();
+        for (agent_key, provider) in agent_mappings {
+            let agent_key = normalize_agent_key(&agent_key, "agent_mappings")?;
+            let provider = normalize_provider(&provider, &format!("agent_mappings.{}", agent_key))?;
+            normalized.insert(agent_key, provider);
+        }
+        req.agent_mappings = Some(normalized);
+    }
+
+    if let Some(provider_models) = req.provider_models.take() {
+        let mut normalized = HashMap::new();
+        for (provider, model) in provider_models {
+            let provider = normalize_provider(&provider, "provider_models")?;
+            if let Some(model) = normalize_optional_model(
+                &provider,
+                &model,
+                &format!("provider_models.{}", provider),
+            )? {
+                normalized.insert(provider, model);
+            }
+        }
+        req.provider_models = Some(normalized);
+    }
+
+    if let Some(subagent_models) = req.subagent_models.take() {
+        let mut normalized = HashMap::new();
+        for (agent_key, mut selection) in subagent_models {
+            let agent_key = normalize_agent_key(&agent_key, "subagent_models")?;
+            selection.provider = normalize_provider(
+                &selection.provider,
+                &format!("subagent_models.{}.provider", agent_key),
+            )?;
+            let model_field = format!("subagent_models.{}.specific_model", agent_key);
+            selection.specific_model = if selection
+                .specific_model
+                .trim()
+                .eq_ignore_ascii_case("provider-default")
+            {
+                "provider-default".to_string()
+            } else {
+                normalize_required_model(
+                    &selection.provider,
+                    &selection.specific_model,
+                    &model_field,
+                )?
+            };
+            normalized.insert(agent_key, selection);
+        }
+        req.subagent_models = Some(normalized);
+    }
+
+    Ok(req)
+}
+
+fn validate_session_id(session_id: &str) -> Result<String, String> {
+    let trimmed = session_id.trim();
+    if trimmed.is_empty() {
+        return Err("session_id cannot be empty".to_string());
+    }
+    if trimmed.len() > 128 {
+        return Err("session_id is too long".to_string());
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+    {
+        return Err("session_id contains unsupported characters".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn validate_run_id(run_id: &str) -> Result<String, String> {
+    let trimmed = run_id.trim();
+    if trimmed.is_empty() {
+        return Err("run_id cannot be empty".to_string());
+    }
+    if trimmed.len() > 128 {
+        return Err("run_id is too long".to_string());
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err("run_id contains unsupported characters".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn normalize_agent_key(agent_key: &str, field: &str) -> Result<String, String> {
+    let normalized = agent_key.trim().to_lowercase();
+    if is_canonical_agent_key(&normalized) {
+        Ok(normalized)
+    } else {
+        Err(format!(
+            "Unsupported {} agent key '{}'. Expected one of: research, backend, frontend, verification",
+            field, agent_key
+        ))
+    }
+}
+
+fn normalize_provider(provider: &str, field: &str) -> Result<String, String> {
+    let normalized = provider.trim().to_lowercase();
+    if is_supported_provider(&normalized) {
+        Ok(normalized)
+    } else {
+        Err(format!(
+            "Unsupported provider selection for {}: '{}'. Expected one of: claude, gemini, grok, codex",
+            field, provider
+        ))
+    }
+}
+
+fn normalize_optional_model(
+    provider: &str,
+    model: &str,
+    field: &str,
+) -> Result<Option<String>, String> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("provider-default") {
+        return Ok(None);
+    }
+    normalize_required_model(provider, trimmed, field).map(Some)
+}
+
+fn normalize_required_model(provider: &str, model: &str, field: &str) -> Result<String, String> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("provider-default") {
+        return Err(format!(
+            "Model selection for {} cannot be empty or provider-default",
+            field
+        ));
+    }
+    if trimmed.len() > 128 || !trimmed.chars().all(is_safe_model_char) {
+        return Err(format!(
+            "Model selection for {} contains unsupported characters",
+            field
+        ));
+    }
+    if !is_known_model_for_provider(provider, trimmed) {
+        return Err(format!(
+            "Unsupported model selection for {}: provider={} model={}",
+            field, provider, trimmed
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn is_safe_model_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/' | '+')
+}
+
+fn is_supported_provider(provider: &str) -> bool {
+    matches!(provider, "claude" | "gemini" | "grok" | "codex")
+}
+
+fn session_allows_subagent_spawns(session_id: &str) -> bool {
+    session_id == MAIN_SESSION_ID
+}
+
+fn is_casual_chat_prompt(prompt: &str) -> bool {
+    let lower = prompt.to_lowercase();
+    let trimmed = lower.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    let has_code_or_path_signal = trimmed.contains("```")
+        || trimmed.contains("[stdout]")
+        || trimmed.contains("[stderr]")
+        || trimmed.contains("[orchestrator]")
+        || trimmed.contains("[rules gate]")
+        || trimmed.contains("c:\\")
+        || trimmed.contains(".rs")
+        || trimmed.contains(".svelte")
+        || trimmed.contains(".ts")
+        || trimmed.contains(".js")
+        || trimmed.contains(".json")
+        || trimmed.contains(".toml")
+        || trimmed.contains(".md")
+        || trimmed.contains("npm ")
+        || trimmed.contains("cargo ")
+        || trimmed.contains("git ");
+    if has_code_or_path_signal {
+        return false;
+    }
+
+    let work_words = [
+        "agent",
+        "analyze",
+        "app",
+        "auth",
+        "backend",
+        "build",
+        "check",
+        "cli",
+        "code",
+        "component",
+        "create",
+        "debug",
+        "delegate",
+        "deploy",
+        "edit",
+        "error",
+        "file",
+        "fix",
+        "folder",
+        "frontend",
+        "implement",
+        "inspect",
+        "model",
+        "orchestrator",
+        "project",
+        "read",
+        "refactor",
+        "research",
+        "review",
+        "route",
+        "run",
+        "search",
+        "subagent",
+        "tauri",
+        "test",
+        "update",
+        "validate",
+        "verify",
+        "write",
+    ];
+
+    !work_words
+        .iter()
+        .any(|word| contains_word_like(trimmed, word))
+}
+
+fn contains_word_like(text: &str, needle: &str) -> bool {
+    text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|part| part == needle)
+}
+
+fn is_known_model_for_provider(provider: &str, model: &str) -> bool {
+    match provider {
+        "claude" => matches!(
+            model,
+            "claude-opus-4.7" | "claude-sonnet-4.6" | "claude-haiku-4.5"
+        ),
+        "gemini" => matches!(
+            model,
+            "gemini-2.5-flash" | "gemini-2.5-pro" | "gemini-2.5-flash-lite"
+        ),
+        "grok" => matches!(model, "grok-build"),
+        "codex" => matches!(model, "gpt-5.5" | "gpt-5.3-codex" | "o3-pro" | "o3"),
+        _ => false,
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnSubagentEvent {
+    pub agent_key: String,
     pub name: String,
     pub role: String,
     pub model: String,
+    pub task: Option<String>,
+    pub parent_session_id: String,
+    pub parent_run_id: String,
 }
 
-fn parse_spawn_command(line: &str) -> Option<SpawnSubagentEvent> {
-    let parts: Vec<&str> = line.split("SPAWN_SUBAGENT:").collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    
-    let content = parts[1].trim();
-    let mut name = String::new();
-    let mut role = String::new();
-    let mut model = String::from("claude");
-    
+fn parse_spawn_command(
+    line: &str,
+    parent_session_id: &str,
+    parent_run_id: &str,
+) -> Option<SpawnSubagentEvent> {
+    let content = line.strip_prefix("SPAWN_SUBAGENT:")?.trim();
+    let mut agent_key = String::new();
+    let mut task_value = String::new();
+
     for pair in content.split(',') {
-        let kv: Vec<&str> = pair.split('=').collect();
-        if kv.len() == 2 {
-            let key = kv[0].trim().to_lowercase();
-            let mut val = kv[1].trim().to_string();
-            // Trim common trailing punctuation or markdown enclosing characters
-            val = val.trim_matches(|c| c == '.' || c == ',' || c == ';' || c == '"' || c == '\'' || c == '`').to_string();
-            match key.as_str() {
-                "name" => name = val,
-                "role" => role = val,
-                "model" => model = val.to_lowercase(),
-                _ => {}
+        let trimmed_pair = pair.trim();
+        let kv: Vec<&str> = pair.splitn(2, '=').collect();
+        if kv.len() != 2 {
+            if !task_value.is_empty() && !trimmed_pair.is_empty() {
+                task_value.push_str(", ");
+                task_value.push_str(trimmed_pair);
+                continue;
             }
+            return None;
+        }
+
+        let key = kv[0].trim().to_lowercase();
+        let val = kv[1]
+            .trim()
+            .trim_matches(|c| c == '.' || c == ',' || c == ';' || c == '"' || c == '\'' || c == '`')
+            .to_string();
+        match key.as_str() {
+            "agent" | "agent_key" => agent_key = val.to_lowercase(),
+            "task" => task_value = val,
+            _ => return None,
         }
     }
-    
-    if !name.is_empty() && !role.is_empty() {
-        Some(SpawnSubagentEvent { name, role, model })
-    } else {
+
+    if !is_canonical_agent_key(&agent_key) {
+        return None;
+    }
+
+    Some(SpawnSubagentEvent {
+        name: canonical_agent_name(&agent_key).to_string(),
+        role: canonical_agent_role(&agent_key).to_string(),
+        model: canonical_agent_default_provider(&agent_key).to_string(),
+        agent_key,
+        task: bounded_spawn_task(&task_value),
+        parent_session_id: parent_session_id.to_string(),
+        parent_run_id: parent_run_id.to_string(),
+    })
+}
+
+fn bounded_spawn_task(task: &str) -> Option<String> {
+    let trimmed = task.trim();
+    if trimmed.is_empty() {
         None
+    } else {
+        Some(trimmed.chars().take(MAX_SPAWN_TASK_CHARS).collect())
     }
 }
 
-pub fn route_task(prompt: &str, requested_model: &str, mappings: Option<&HashMap<String, String>>) -> String {
+fn is_canonical_agent_key(agent_key: &str) -> bool {
+    matches!(
+        agent_key,
+        "research" | "backend" | "frontend" | "verification"
+    )
+}
+
+fn canonical_agent_name(agent_key: &str) -> &'static str {
+    match agent_key {
+        "research" => "Research Agent",
+        "backend" => "Backend Coder Agent",
+        "frontend" => "Frontend Coder Agent",
+        "verification" => "Verification Agent",
+        _ => "Unknown Agent",
+    }
+}
+
+fn canonical_agent_role(agent_key: &str) -> &'static str {
+    match agent_key {
+        "research" => "Codebase search & symbols",
+        "backend" => "Rust / API / backend services",
+        "frontend" => "Svelte / TS / styling design",
+        "verification" => "Cargo check / test execution",
+        _ => "Unknown role",
+    }
+}
+
+fn canonical_agent_default_provider(agent_key: &str) -> &'static str {
+    match agent_key {
+        "research" => "grok",
+        "backend" => "codex",
+        "frontend" => "claude",
+        "verification" => "gemini",
+        _ => "claude",
+    }
+}
+
+fn format_agent_registry(
+    mappings: Option<&HashMap<String, String>>,
+    provider_models: Option<&HashMap<String, String>>,
+    subagent_models: Option<&HashMap<String, AgentModelSelection>>,
+) -> String {
+    let default_roles = [
+        ("research", "Research Agent", "grok"),
+        ("backend", "Backend Coder Agent", "codex"),
+        ("frontend", "Frontend Coder Agent", "claude"),
+        ("verification", "Verification Agent", "gemini"),
+    ];
+
+    default_roles
+        .iter()
+        .map(|(key, label, fallback_model)| {
+            let registry_selection = subagent_models.and_then(|m| m.get(*key));
+            let provider = registry_selection
+                .map(|s| s.provider.as_str())
+                .or_else(|| mappings.and_then(|m| m.get(*key)).map(|s| s.as_str()))
+                .unwrap_or(*fallback_model);
+            let specific = registry_selection
+                .map(|s| s.specific_model.clone())
+                .or_else(|| provider_models.and_then(|m| m.get(provider)).cloned())
+                .unwrap_or_else(|| "provider-default".to_string());
+            let active_flag = registry_selection
+                .map(|s| {
+                    if s.active {
+                        "active=true"
+                    } else {
+                        "active=false"
+                    }
+                })
+                .unwrap_or("active=unknown");
+            let role_text = registry_selection.map(|s| s.role.as_str()).unwrap_or(label);
+            format!(
+                "- agent={}: label={} provider={} specific_model={} {} role={}",
+                key, label, provider, specific, active_flag, role_text
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn select_specific_model(
+    req: &PromptRequest,
+    final_model: &str,
+    routed_agent_key: Option<&str>,
+) -> Option<String> {
+    if let Some(agent_key) = routed_agent_key {
+        if let Some(agent_specific) = req
+            .subagent_models
+            .as_ref()
+            .and_then(|m| m.get(agent_key))
+            .filter(|selection| selection.provider == final_model)
+            .filter(|selection| {
+                !selection
+                    .specific_model
+                    .eq_ignore_ascii_case("provider-default")
+            })
+            .map(|selection| selection.specific_model.clone())
+        {
+            return Some(agent_specific);
+        }
+    }
+
+    if final_model == req.model {
+        if let Some(specific) = req.specific_model.clone() {
+            return Some(specific);
+        }
+    }
+
+    req.provider_models
+        .as_ref()
+        .and_then(|m| m.get(final_model))
+        .cloned()
+}
+
+pub fn route_agent_key(prompt: &str) -> Option<String> {
+    let trimmed = prompt.trim();
+    if trimmed.starts_with('@') {
+        return None;
+    }
+
+    let lower_prompt = trimmed.to_lowercase();
+    if lower_prompt.contains("research agent") || lower_prompt.contains("researcher") {
+        return Some("research".to_string());
+    }
+    if lower_prompt.contains("backend coder agent") || lower_prompt.contains("backend coder") {
+        return Some("backend".to_string());
+    }
+    if lower_prompt.contains("frontend coder agent") || lower_prompt.contains("frontend coder") {
+        return Some("frontend".to_string());
+    }
+    if lower_prompt.contains("verification agent") || lower_prompt.contains("verifier") {
+        return Some("verification".to_string());
+    }
+    None
+}
+
+pub fn route_task(
+    prompt: &str,
+    requested_model: &str,
+    mappings: Option<&HashMap<String, String>>,
+) -> String {
     let trimmed = prompt.trim();
     let lower_prompt = trimmed.to_lowercase();
-    
+
     // Helper to get mapped model or fallback
     let get_mapped_model = |agent_key: &str, fallback: &str| -> String {
         if let Some(m) = mappings {
@@ -467,7 +1282,7 @@ pub fn route_task(prompt: &str, requested_model: &str, mappings: Option<&HashMap
         }
         fallback.to_string()
     };
-    
+
     // 1. Explicit routing prefix like @grok, @claude, @codex, @gemini
     if trimmed.starts_with('@') {
         let mut parts = trimmed.splitn(2, |c: char| c.is_whitespace());

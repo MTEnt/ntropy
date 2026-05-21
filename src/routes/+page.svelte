@@ -1,17 +1,48 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke, isTauri } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
 
   // Svelte 5 Runes for highly reactive state management
   let activeTab = $state("chat"); // Right-side panel tab: "chat" (subagents), "skills", "rules"
   let currentView = $state("chat"); // Main central panel view: "chat", "tasks"
-  
+
   let prompt = $state("");
   let streamLogs = $state<string[]>([]);
+  const MAIN_SESSION_ID = "active-workspace-session";
+  const MODEL_PREFS_STORAGE_KEY = "ntropyModelPreferences";
   let activeStreamingMessageId = $state<string | null>(null);
-  let streamTimeout: any = null;
-  let rawStreamingText = "";
+  let streamingMessageBySession = $state<Record<string, string>>({});
+  let streamingMetaBySession = $state<Record<string, StreamingSessionMeta>>({});
+  let rawStreamingTextBySession = $state<Record<string, string>>({});
+  let rawErrorTextBySession = $state<Record<string, string>>({});
+  let promptBySession = $state<Record<string, string>>({});
+  let sessionModelBySession = $state<Record<string, { provider: string, specificModel: string }>>({});
+  let tokenUsageByModel = $state<Record<string, { provider: string, specificModel: string, totalTokens: number, lastTokens: number, actions: number }>>({});
+  let delegatedAgentKeysBySession = $state<Record<string, Record<string, boolean>>>({});
+  let storedConversationModels = $state<Record<string, string>>({});
+  let streamTimeouts: Record<string, any> = {};
+  let pendingTokenMarkerBySession: Record<string, boolean> = {};
+  let preferredChatModel = $state("claude");
+  const MAX_STREAM_LOG_LINES = 2000;
+
+  function appendStreamLog(log: string) {
+    streamLogs = [...streamLogs, log].slice(-MAX_STREAM_LOG_LINES);
+  }
+
+  function canUseTauriIpc(): boolean {
+    const tauriInternals = (globalThis as any).__TAURI_INTERNALS__;
+    return isTauri()
+      && typeof tauriInternals?.invoke === "function"
+      && typeof tauriInternals?.transformCallback === "function";
+  }
+
+  function createRunId(): string {
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+      return crypto.randomUUID();
+    }
+    return `run-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  }
 
   function sanitizeStdout(text: string): string {
     // Strip ANSI colors, styling, cursor controls, etc.
@@ -30,11 +61,184 @@
       if (trimmed.startsWith("SUCCESS: The process") || trimmed.includes("has been terminated.")) {
         return false;
       }
+      if (trimmed.includes("SPAWN_SUBAGENT:")) {
+        return false;
+      }
       
       return true;
     });
 
     return filteredLines.join("\n").trim();
+  }
+
+  function cleanCliText(text: string): string {
+    return text
+      .replace(/[\u001b\x1b]\[[0-9;?]*[a-zA-Z]/g, "")
+      .replace(/[\u001b\x1b]\([A-Z]/g, "")
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n");
+  }
+
+  function isCliMetadataLine(trimmed: string): boolean {
+    if (!trimmed) return false;
+    if (trimmed.startsWith("[ORCHESTRATOR]")) return true;
+    if (trimmed.startsWith("[stderr]")) return true;
+    if (trimmed.includes("SPAWN_SUBAGENT:")) return true;
+    if (/^-{5,}$/.test(trimmed)) return true;
+    if (/^OpenAI Codex v/i.test(trimmed)) return true;
+    if (/^(codex|gemini|grok|claude)$/i.test(trimmed)) return true;
+    if (/^(workdir|model|provider|approval|sandbox|reasoning effort|reasoning summaries|session id):/i.test(trimmed)) return true;
+    if (/^202\d-\d\d-\d\dT.*\b(ERROR|WARN)\b/i.test(trimmed)) return true;
+    return false;
+  }
+
+  function cleanChatOutput(text: string, sessionId: string): string {
+    const originalPrompt = promptBySession[sessionId] || "";
+    const promptLines = new Set(
+      originalPrompt
+        .split("\n")
+        .map(line => line.trim())
+        .filter(Boolean)
+    );
+    const lines = cleanCliText(text).split("\n");
+    const kept: string[] = [];
+    let skipTokenNumber = false;
+    let skipSystemBlock = false;
+    let skipUserBlock = false;
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+
+      if (!trimmed) {
+        if (kept.length > 0 && kept[kept.length - 1] !== "") kept.push("");
+        continue;
+      }
+
+      if (isCliMetadataLine(trimmed)) continue;
+      if (/^tokens used$/i.test(trimmed) || /^tokens?[: ]/i.test(trimmed)) {
+        skipTokenNumber = true;
+        continue;
+      }
+      if (skipTokenNumber && /^[\d,]+$/.test(trimmed)) {
+        skipTokenNumber = false;
+        continue;
+      }
+      skipTokenNumber = false;
+
+      if (trimmed === "user") {
+        skipUserBlock = true;
+        continue;
+      }
+      if (skipUserBlock) {
+        if (trimmed.includes("[SYSTEM INSTRUCTION]")) {
+          skipUserBlock = false;
+          skipSystemBlock = true;
+        }
+        continue;
+      }
+
+      if (trimmed.includes("[SYSTEM INSTRUCTION]")) {
+        skipSystemBlock = true;
+        continue;
+      }
+      if (skipSystemBlock) {
+        if (/^(assistant|final answer|answer)$/i.test(trimmed)) {
+          skipSystemBlock = false;
+          continue;
+        } else {
+          continue;
+        }
+      }
+
+      if (/^(assistant|final answer|answer)$/i.test(trimmed)) continue;
+      if (promptLines.has(trimmed)) continue;
+      if (isCliMetadataLine(trimmed)) continue;
+
+      kept.push(line.trimEnd());
+    }
+
+    return kept.join("\n").trim();
+  }
+
+  function extractFallbackChatOutput(stderrText: string, sessionId: string): string {
+    const cleaned = cleanCliText(stderrText);
+    const tokenMarker = cleaned.toLowerCase().lastIndexOf("tokens used");
+    if (tokenMarker >= 0) {
+      const afterMarker = cleaned.slice(tokenMarker).split("\n");
+      const tokenLineHasCount = /tokens used\s*[:=]?\s*[\d,]+/i.test(afterMarker[0] || "");
+      const startIndex = tokenLineHasCount ? 1 : (/^[\d,]+$/.test((afterMarker[1] || "").trim()) ? 2 : 1);
+      const afterTokenCount = afterMarker.slice(startIndex).join("\n");
+      const visible = cleanChatOutput(afterTokenCount, sessionId);
+      if (visible) return visible;
+    }
+
+    const errorLine = cleaned
+      .split("\n")
+      .map(line => line.trim())
+      .find(line => !isCliMetadataLine(line) && /\b(error|failed|denied|read-only|permission|cannot|can't)\b/i.test(line));
+    return errorLine || "";
+  }
+
+  function formatTokens(value: number): string {
+    return value.toLocaleString();
+  }
+
+  function registerSessionModel(sessionId: string, provider: string, specificModel: string) {
+    sessionModelBySession = {
+      ...sessionModelBySession,
+      [sessionId]: { provider, specificModel: specificModel || "provider-default" }
+    };
+  }
+
+  function recordBackendModelSelection(sessionId: string, data: string) {
+    const match = cleanCliText(data).match(/\[ORCHESTRATOR\]\s*Exact backend model selection:\s*provider=([^\s,]+)\s+specific_model=([^\s,]+)/i);
+    if (match) {
+      registerSessionModel(sessionId, match[1], match[2]);
+    }
+  }
+
+  function addTokenUsage(sessionId: string, tokens: number) {
+    if (!Number.isFinite(tokens) || tokens <= 0) return;
+    const modelInfo = sessionModelBySession[sessionId] || { provider: "unknown", specificModel: "provider-default" };
+    const key = `${modelInfo.provider}:${modelInfo.specificModel}`;
+    const existing = tokenUsageByModel[key] || {
+      provider: modelInfo.provider,
+      specificModel: modelInfo.specificModel,
+      totalTokens: 0,
+      lastTokens: 0,
+      actions: 0
+    };
+    tokenUsageByModel = {
+      ...tokenUsageByModel,
+      [key]: {
+        ...existing,
+        totalTokens: existing.totalTokens + tokens,
+        lastTokens: tokens,
+        actions: existing.actions + 1
+      }
+    };
+  }
+
+  function recordTokenUsage(sessionId: string, data: string) {
+    const lines = cleanCliText(data).split("\n").map(line => line.trim()).filter(Boolean);
+    for (const line of lines) {
+      const sameLine = line.match(/tokens used\s*[:=]?\s*([\d,]+)/i);
+      if (sameLine) {
+        addTokenUsage(sessionId, Number(sameLine[1].replace(/,/g, "")));
+        pendingTokenMarkerBySession[sessionId] = false;
+        continue;
+      }
+
+      if (/^tokens used$/i.test(line)) {
+        pendingTokenMarkerBySession[sessionId] = true;
+        continue;
+      }
+
+      if (pendingTokenMarkerBySession[sessionId] && /^[\d,]+$/.test(line)) {
+        addTokenUsage(sessionId, Number(line.replace(/,/g, "")));
+        pendingTokenMarkerBySession[sessionId] = false;
+      }
+    }
   }
   
   // Rules State
@@ -77,6 +281,58 @@
     activeModel: string;
   }
 
+  interface StreamingSessionMeta {
+    conversationId: string;
+    messageId: string;
+    runId: string;
+    sender: string;
+    type: 'user' | 'agent' | 'system';
+    subagentId?: string;
+    parentSessionId?: string;
+    persistedFinal?: boolean;
+  }
+
+  interface CliFinishedPayload {
+    sessionId: string;
+    success: boolean;
+    exitCode?: number | null;
+    error?: string;
+  }
+
+  interface Subagent {
+    id: string;
+    name: string;
+    role: string;
+    model: string;
+    specificModel: string;
+    active: boolean;
+    cost: string;
+  }
+
+  interface StoredSubagentPreference {
+    id: string;
+    model: string;
+    specificModel: string;
+    active: boolean;
+  }
+
+  interface ModelPreferences {
+    activeChatModel?: string;
+    providerModels?: Record<string, string>;
+    subagents?: StoredSubagentPreference[];
+    conversationModels?: Record<string, string>;
+  }
+
+  interface BackendSubagentModelSelection {
+    name: string;
+    role: string;
+    provider: string;
+    specificModel: string;
+    active: boolean;
+  }
+
+  type AgentKey = "research" | "backend" | "frontend" | "verification";
+
   let conversations = $state<Conversation[]>([]);
   let activeConversationId = $state<string | null>(null);
   let showContextMenu = $state(false);
@@ -96,7 +352,7 @@
 
   // Derived active conversation model
   let activeModel = $derived(
-    activeConversation ? activeConversation.activeModel : "claude"
+    activeConversation ? activeConversation.activeModel : preferredChatModel
   );
 
   // Scheduled Tasks State
@@ -199,7 +455,7 @@
           title,
           lastUpdated: new Date(updated_at).getTime(),
           messages,
-          activeModel: "claude"
+          activeModel: getSavedConversationModel(id)
         });
       }
       
@@ -256,8 +512,9 @@
       title: initialTitle,
       lastUpdated: Date.now(),
       messages: [],
-      activeModel: "claude"
+      activeModel: preferredChatModel
     };
+    storedConversationModels = { ...storedConversationModels, [newId]: preferredChatModel };
     conversations = [newConv, ...conversations];
     activeConversationId = newId;
     
@@ -266,6 +523,7 @@
     } catch (e) {
       console.error("Failed to create session in SQLite:", e);
     }
+    saveModelPreferences();
     
     return newId;
   }
@@ -306,10 +564,30 @@
     showContextMenu = false;
   }
 
-  async function addMessageToActiveConversation(sender: string, text: string, type: 'user' | 'agent' | 'system', id?: string) {
-    if (!activeConversationId) return;
+  async function persistConversationMessage(conversationId: string, sender: string, text: string, type: 'user' | 'agent' | 'system') {
+    try {
+      await invoke("add_session_message", {
+        sessionId: conversationId,
+        role: `${sender}|${type}`,
+        content: text
+      });
+    } catch (e) {
+      console.error("Failed to add message to SQLite:", e);
+    }
+  }
+
+  async function addMessageToConversation(
+    conversationId: string,
+    sender: string,
+    text: string,
+    type: 'user' | 'agent' | 'system',
+    id?: string,
+    persist = true
+  ) {
+    let didAdd = false;
     conversations = conversations.map(c => {
-      if (c.id === activeConversationId) {
+      if (c.id === conversationId) {
+        didAdd = true;
         let title = c.title;
         if (title === "New Conversation" && type === "user") {
           title = text.length > 25 ? text.substring(0, 25) + "..." : text;
@@ -325,23 +603,23 @@
       return c;
     });
 
-    try {
-      await invoke("add_session_message", {
-        sessionId: activeConversationId,
-        role: `${sender}|${type}`,
-        content: text
-      });
-    } catch (e) {
-      console.error("Failed to add message to SQLite:", e);
+    if (persist && didAdd) {
+      await persistConversationMessage(conversationId, sender, text, type);
     }
   }
 
-  function updateStreamingMessageText(msgId: string, text: string) {
+  async function addMessageToActiveConversation(sender: string, text: string, type: 'user' | 'agent' | 'system', id?: string, persist = true) {
     if (!activeConversationId) return;
+    await addMessageToConversation(activeConversationId, sender, text, type, id, persist);
+  }
+
+  function updateStreamingMessageText(msgId: string, text: string, conversationId = activeConversationId) {
+    if (!conversationId) return;
     conversations = conversations.map(c => {
-      if (c.id === activeConversationId) {
+      if (c.id === conversationId) {
         return {
           ...c,
+          lastUpdated: Date.now(),
           messages: c.messages.map(m => {
             if (m.id === msgId) {
               return { ...m, text };
@@ -352,6 +630,187 @@
       }
       return c;
     });
+  }
+
+  function normalizeCliFinishedPayload(payload: any): CliFinishedPayload | null {
+    if (typeof payload === "string") {
+      return { sessionId: payload, success: true };
+    }
+    if (!payload || typeof payload !== "object") return null;
+
+    const sessionId = String(payload.session_id || payload.sessionId || payload.id || "");
+    if (!sessionId) return null;
+
+    const exitCodeRaw = payload.exit_code ?? payload.exitCode ?? payload.code;
+    const exitCode = exitCodeRaw === undefined || exitCodeRaw === null ? null : Number(exitCodeRaw);
+    let success = true;
+    if (typeof payload.success === "boolean") {
+      success = payload.success;
+    } else if (typeof payload.ok === "boolean") {
+      success = payload.ok;
+    } else if (typeof payload.status === "string") {
+      success = !/\b(fail|failed|error|errored|cancel|cancelled)\b/i.test(payload.status);
+    } else if (Number.isFinite(exitCode)) {
+      success = exitCode === 0;
+    } else if (payload.error) {
+      success = false;
+    }
+
+    return {
+      sessionId,
+      success,
+      exitCode: Number.isFinite(exitCode) ? exitCode : null,
+      error: typeof payload.error === "string"
+        ? payload.error
+        : (typeof payload.message === "string" ? payload.message : undefined)
+    };
+  }
+
+  function formatFinishedStatus(finished: CliFinishedPayload): string {
+    if (finished.success) return "finished successfully";
+    const exitText = finished.exitCode === null || finished.exitCode === undefined ? "" : ` with exit code ${finished.exitCode}`;
+    const errorText = finished.error ? `: ${finished.error}` : "";
+    return `failed${exitText}${errorText}`;
+  }
+
+  function failureFallbackForFinished(finished: CliFinishedPayload): string {
+    return `[Process ${formatFinishedStatus(finished)}. Check the terminal log for details.]`;
+  }
+
+  function hasLiveSubagentSession(subagentId: string): boolean {
+    return Object.values(streamingMetaBySession).some(meta => meta.subagentId === subagentId);
+  }
+
+  function setSubagentActive(subagentId: string, active: boolean) {
+    subagents = subagents.map(existing => existing.id === subagentId ? { ...existing, active } : existing);
+  }
+
+  function registerStreamingSession(
+    sessionId: string,
+    messageId: string,
+    sourcePrompt: string,
+    provider: string,
+    specificModel: string,
+    conversationId: string,
+    sender: string,
+    type: 'user' | 'agent' | 'system' = 'agent',
+    subagentId?: string,
+    parentSessionId?: string,
+    runId = createRunId()
+  ): string {
+    streamingMessageBySession = { ...streamingMessageBySession, [sessionId]: messageId };
+    streamingMetaBySession = {
+      ...streamingMetaBySession,
+      [sessionId]: {
+        conversationId,
+        messageId,
+        runId,
+        sender,
+        type,
+        subagentId,
+        parentSessionId,
+        persistedFinal: false
+      }
+    };
+    rawStreamingTextBySession = { ...rawStreamingTextBySession, [sessionId]: "" };
+    rawErrorTextBySession = { ...rawErrorTextBySession, [sessionId]: "" };
+    promptBySession = { ...promptBySession, [sessionId]: sourcePrompt };
+    registerSessionModel(sessionId, provider, specificModel);
+    if (sessionId === MAIN_SESSION_ID) {
+      activeStreamingMessageId = messageId;
+    }
+    return runId;
+  }
+
+  function clearStreamingSession(sessionId: string) {
+    const meta = streamingMetaBySession[sessionId];
+    const { [sessionId]: _msg, ...remainingMessages } = streamingMessageBySession;
+    const { [sessionId]: _meta, ...remainingMeta } = streamingMetaBySession;
+    const { [sessionId]: _raw, ...remainingRaw } = rawStreamingTextBySession;
+    const { [sessionId]: _err, ...remainingErrors } = rawErrorTextBySession;
+    const { [sessionId]: _prompt, ...remainingPrompts } = promptBySession;
+    const { [sessionId]: _delegated, ...remainingDelegated } = delegatedAgentKeysBySession;
+    streamingMessageBySession = remainingMessages;
+    streamingMetaBySession = remainingMeta;
+    rawStreamingTextBySession = remainingRaw;
+    rawErrorTextBySession = remainingErrors;
+    promptBySession = remainingPrompts;
+    delegatedAgentKeysBySession = remainingDelegated;
+    delete pendingTokenMarkerBySession[sessionId];
+    if (streamTimeouts[sessionId]) {
+      clearTimeout(streamTimeouts[sessionId]);
+      delete streamTimeouts[sessionId];
+    }
+    if (sessionId === MAIN_SESSION_ID) {
+      activeStreamingMessageId = null;
+    }
+    if (meta?.subagentId) {
+      const stillRunningSameAgent = Object.entries(remainingMeta).some(([, other]) => other.subagentId === meta.subagentId);
+      if (!stillRunningSameAgent) {
+        setSubagentActive(meta.subagentId, false);
+      }
+    }
+  }
+
+  function appendStreamingChunk(sessionId: string, stream: string, data: string) {
+    const msgId = streamingMessageBySession[sessionId];
+    const meta = streamingMetaBySession[sessionId];
+    if (!msgId || !meta) return;
+
+    recordBackendModelSelection(sessionId, data);
+    recordTokenUsage(sessionId, data);
+
+    if (stream === "stderr") {
+      const nextError = `${rawErrorTextBySession[sessionId] || ""}${data}`;
+      rawErrorTextBySession = { ...rawErrorTextBySession, [sessionId]: nextError };
+    } else {
+      const nextRaw = `${rawStreamingTextBySession[sessionId] || ""}${data}`;
+      rawStreamingTextBySession = { ...rawStreamingTextBySession, [sessionId]: nextRaw };
+      const visible = cleanChatOutput(nextRaw, sessionId);
+      if (visible) {
+        updateStreamingMessageText(msgId, visible, meta.conversationId);
+      }
+    }
+
+    if (streamTimeouts[sessionId]) clearTimeout(streamTimeouts[sessionId]);
+    streamTimeouts[sessionId] = setTimeout(() => {
+      const stillStreamingMsgId = streamingMessageBySession[sessionId];
+      const stillStreamingMeta = streamingMetaBySession[sessionId];
+      if (!stillStreamingMsgId || !stillStreamingMeta) return;
+      const visible = cleanChatOutput(rawStreamingTextBySession[sessionId] || "", sessionId)
+        || extractFallbackChatOutput(rawErrorTextBySession[sessionId] || "", sessionId);
+      updateStreamingMessageText(
+        stillStreamingMsgId,
+        visible || "[Still running. Check the Terminal Stdout Log for live details.]",
+        stillStreamingMeta.conversationId
+      );
+    }, 120000);
+  }
+
+  async function persistFinalStreamingMessage(sessionId: string, text: string) {
+    const meta = streamingMetaBySession[sessionId];
+    if (!meta || meta.persistedFinal || !text.trim()) return;
+    streamingMetaBySession = {
+      ...streamingMetaBySession,
+      [sessionId]: { ...meta, persistedFinal: true }
+    };
+    await persistConversationMessage(meta.conversationId, meta.sender, text, meta.type);
+  }
+
+  async function finishStreamingSession(sessionId: string, emptyFallback = "[Process finished without producing chat output. Check the terminal log for details.]") {
+    const msgId = streamingMessageBySession[sessionId];
+    const meta = streamingMetaBySession[sessionId];
+    try {
+      if (msgId && meta) {
+        const finalText = cleanChatOutput(rawStreamingTextBySession[sessionId] || "", sessionId)
+          || extractFallbackChatOutput(rawErrorTextBySession[sessionId] || "", sessionId);
+        const persistedText = finalText || emptyFallback;
+        updateStreamingMessageText(msgId, persistedText, meta.conversationId);
+        await persistFinalStreamingMessage(sessionId, persistedText);
+      }
+    } finally {
+      clearStreamingSession(sessionId);
+    }
   }
 
   function loadRecentProjects() {
@@ -429,7 +888,7 @@
         title: "Workspace Load Error",
         lastUpdated: Date.now(),
         messages: [{ sender: "Workspace Engine", text: `❌ Error opening project: ${e}`, type: 'system' }],
-        activeModel: "claude"
+        activeModel: preferredChatModel
       }];
       activeConversationId = `conv-fallback`;
     }
@@ -437,26 +896,191 @@
   
   // Model mapping configuration
   const providerModelsMap: Record<string, string[]> = {
-    claude: ["claude-opus-4.7", "claude-sonnet-4.6", "claude-haiku-4.5"],
-    gemini: ["gemini-3.5-flash", "gemini-3.5-pro", "gemini-3.1-pro", "gemini-3.1-flash-lite"],
-    grok: ["grok-4.3", "grok-code-fast-1", "grok-3"],
-    codex: ["gpt-5.5", "gpt-5.5-instant", "gpt-5.3-codex", "o3-pro", "o3"]
+    claude: ["provider-default", "claude-opus-4.7", "claude-sonnet-4.6", "claude-haiku-4.5"],
+    gemini: ["provider-default", "gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite"],
+    grok: ["grok-build"],
+    codex: ["provider-default", "gpt-5.5", "gpt-5.3-codex", "o3-pro", "o3"]
   };
 
   let defaultProviderModels = $state<Record<string, string>>({
     claude: "claude-sonnet-4.6",
-    gemini: "gemini-3.5-flash",
-    grok: "grok-4.3",
+    gemini: "provider-default",
+    grok: "grok-build",
     codex: "gpt-5.5"
   });
   
   // Subagent Control Panel State
-  let subagents = $state<Array<{ id: string, name: string, role: string, model: string, specificModel: string, active: boolean, cost: string }>>([
-    { id: "sa-1", name: "Research Agent", role: "Codebase search & symbols", model: "grok", specificModel: "grok-4.3", active: true, cost: "$0.02" },
+  let subagents = $state<Subagent[]>([
+    { id: "sa-1", name: "Research Agent", role: "Codebase search & symbols", model: "grok", specificModel: "grok-build", active: false, cost: "$0.02" },
     { id: "sa-2b", name: "Backend Coder Agent", role: "Rust / API / backend services", model: "codex", specificModel: "gpt-5.3-codex", active: false, cost: "$0.03" },
     { id: "sa-2f", name: "Frontend Coder Agent", role: "Svelte / TS / styling design", model: "claude", specificModel: "claude-sonnet-4.6", active: false, cost: "$0.03" },
-    { id: "sa-3", name: "Verification Agent", role: "Cargo check / test execution", model: "gemini", specificModel: "gemini-3.5-flash", active: true, cost: "$0.01" }
+    { id: "sa-3", name: "Verification Agent", role: "Cargo check / test execution", model: "gemini", specificModel: "provider-default", active: false, cost: "$0.01" }
   ]);
+
+  function isKnownProvider(provider: string): boolean {
+    return Object.prototype.hasOwnProperty.call(providerModelsMap, provider);
+  }
+
+  function isValidProviderModel(provider: string, specificModel: string): boolean {
+    return (providerModelsMap[provider] || []).includes(specificModel);
+  }
+
+  function getSafeSpecificModel(provider: string, requested?: string): string {
+    if (requested && isValidProviderModel(provider, requested)) {
+      return requested;
+    }
+    if (defaultProviderModels[provider] && isValidProviderModel(provider, defaultProviderModels[provider])) {
+      return defaultProviderModels[provider];
+    }
+    return (providerModelsMap[provider] || [])[0] || "";
+  }
+
+  function formatSpecificModelLabel(specificModel: string): string {
+    return specificModel === "provider-default" ? "Provider default / auto" : specificModel;
+  }
+
+  function getSavedConversationModel(conversationId: string): string {
+    const saved = storedConversationModels[conversationId];
+    return saved && isKnownProvider(saved) ? saved : preferredChatModel;
+  }
+
+  function loadModelPreferences() {
+    try {
+      const stored = localStorage.getItem(MODEL_PREFS_STORAGE_KEY);
+      if (!stored) return;
+
+      const prefs = JSON.parse(stored) as ModelPreferences;
+      if (prefs.activeChatModel && isKnownProvider(prefs.activeChatModel)) {
+        preferredChatModel = prefs.activeChatModel;
+      }
+
+      if (prefs.providerModels) {
+        const nextProviderModels = { ...defaultProviderModels };
+        for (const [provider, specificModel] of Object.entries(prefs.providerModels)) {
+          if (isKnownProvider(provider) && isValidProviderModel(provider, specificModel)) {
+            nextProviderModels[provider] = specificModel;
+          }
+        }
+        defaultProviderModels = nextProviderModels;
+      }
+
+      if (Array.isArray(prefs.subagents)) {
+        const prefsById = new Map(prefs.subagents.map(sa => [sa.id, sa]));
+        subagents = subagents.map(sa => {
+          const saved = prefsById.get(sa.id);
+          if (!saved || !isKnownProvider(saved.model)) return sa;
+          return {
+            ...sa,
+            model: saved.model,
+            specificModel: getSafeSpecificModel(saved.model, saved.specificModel),
+            active: false
+          };
+        });
+      }
+
+      if (prefs.conversationModels) {
+        const nextConversationModels: Record<string, string> = {};
+        for (const [conversationId, provider] of Object.entries(prefs.conversationModels)) {
+          if (isKnownProvider(provider)) {
+            nextConversationModels[conversationId] = provider;
+          }
+        }
+        storedConversationModels = nextConversationModels;
+      }
+    } catch (e) {
+      console.error("Failed to load model preferences:", e);
+    }
+  }
+
+  function saveModelPreferences() {
+    try {
+      const conversationModels: Record<string, string> = { ...storedConversationModels };
+      for (const conversation of conversations) {
+        if (isKnownProvider(conversation.activeModel)) {
+          conversationModels[conversation.id] = conversation.activeModel;
+        }
+      }
+      const prefs: ModelPreferences = {
+        activeChatModel: preferredChatModel,
+        providerModels: { ...defaultProviderModels },
+        subagents: subagents.map(sa => ({
+          id: sa.id,
+          model: sa.model,
+          specificModel: sa.specificModel,
+          active: false
+        })),
+        conversationModels
+      };
+      localStorage.setItem(MODEL_PREFS_STORAGE_KEY, JSON.stringify(prefs));
+    } catch (e) {
+      console.error("Failed to save model preferences:", e);
+    }
+  }
+
+  function getSubagentRoleKey(sa: Subagent): string | null {
+    if (sa.id === "sa-1") return "research";
+    if (sa.id === "sa-2b") return "backend";
+    if (sa.id === "sa-2f") return "frontend";
+    if (sa.id === "sa-3") return "verification";
+    return null;
+  }
+
+  function normalizeCanonicalAgentKey(value: unknown): AgentKey | null {
+    if (typeof value !== "string") return null;
+    const key = value.trim().toLowerCase();
+    if (key === "research" || key === "backend" || key === "frontend" || key === "verification") {
+      return key as AgentKey;
+    }
+    return null;
+  }
+
+  function getSubagentByRoleKey(agentKey: AgentKey): Subagent | null {
+    return subagents.find(sa => getSubagentRoleKey(sa) === agentKey) || null;
+  }
+
+  function hasDelegatedAgent(parentSessionId: string, agentKey: AgentKey): boolean {
+    return !!delegatedAgentKeysBySession[parentSessionId]?.[agentKey];
+  }
+
+  function markDelegatedAgent(parentSessionId: string, agentKey: AgentKey) {
+    delegatedAgentKeysBySession = {
+      ...delegatedAgentKeysBySession,
+      [parentSessionId]: {
+        ...(delegatedAgentKeysBySession[parentSessionId] || {}),
+        [agentKey]: true
+      }
+    };
+  }
+
+  function reserveDelegatedAgents(parentSessionId: string, agentKeys: AgentKey[]): AgentKey[] {
+    const reserved: AgentKey[] = [];
+    for (const agentKey of agentKeys) {
+      if (hasDelegatedAgent(parentSessionId, agentKey)) continue;
+      markDelegatedAgent(parentSessionId, agentKey);
+      reserved.push(agentKey);
+    }
+    return reserved;
+  }
+
+  function canSessionSpawnSubagents(parentSessionId: string): boolean {
+    return parentSessionId === MAIN_SESSION_ID && !!streamingMetaBySession[parentSessionId];
+  }
+
+  function getSubagentModelRegistry(): Record<string, BackendSubagentModelSelection> {
+    const registry: Record<string, BackendSubagentModelSelection> = {};
+    subagents.forEach(sa => {
+      const roleKey = getSubagentRoleKey(sa);
+      if (!roleKey) return;
+      registry[roleKey] = {
+        name: sa.name,
+        role: sa.role,
+        provider: sa.model,
+        specificModel: sa.specificModel,
+        active: sa.active
+      };
+    });
+    return registry;
+  }
 
   // nTropy Learning Loop Skills
   let skills = $state<Array<{ name: string, description: string, trigger_phrases: string[] }>>([]);
@@ -539,6 +1163,9 @@
 
   async function executeTask(task: ScheduledTask) {
     if (task.status === 'running') return;
+    const taskSessionId = `task-session-${task.id}`;
+    const taskSpecificModel = getSafeSpecificModel(task.cli);
+    registerSessionModel(taskSessionId, task.cli, taskSpecificModel);
     
     // Mark as running and clear output
     tasks = tasks.map(t => t.id === task.id ? { 
@@ -557,11 +1184,14 @@
       streamLogs = [...streamLogs, `[TASK RUNNER] Triggered task "${task.name}" using CLI "${task.cli.toUpperCase()}"`];
       
       await invoke("run_cli_prompt", {
-        sessionId: `task-session-${task.id}`,
+        sessionId: taskSessionId,
+        runId: createRunId(),
         model: task.cli,
+        specificModel: taskSpecificModel,
         prompt: task.command,
         agentMappings: getAgentMappings(),
-        providerModels: getProviderModels()
+        providerModels: getProviderModels(),
+        subagentModels: getSubagentModelRegistry()
       });
     } catch (e) {
       const finalStatus = task.schedule === 'once' ? 'paused' : 'active';
@@ -588,14 +1218,22 @@
     let schedulerInterval: any = null;
 
     async function init() {
+      loadModelPreferences();
+      if (!canUseTauriIpc()) {
+        loadRecentProjects();
+        return;
+      }
+
       // 2. Listen for background subprocess streams from Rust
       unlistenCliOutput = await listen("cli-output", (event: any) => {
         const payload: any = event.payload;
         const formattedLog = `[${payload.stream.toUpperCase()}] ${payload.data}`;
-        streamLogs = [...streamLogs, formattedLog];
+        appendStreamLog(formattedLog);
         
         // Route output to task if it belongs to a task run session
         if (payload.session_id.startsWith("task-session-")) {
+          recordBackendModelSelection(payload.session_id, payload.data);
+          recordTokenUsage(payload.session_id, payload.data);
           const taskId = payload.session_id.replace("task-session-", "");
           const sanitized = sanitizeStdout(payload.data);
           tasks = tasks.map(t => {
@@ -610,23 +1248,16 @@
           return;
         }
         
-        // Stream to conversational chat bubble if this is stdout and we have an active stream ID
-        if (payload.stream === "stdout" && activeStreamingMessageId) {
-          rawStreamingText += payload.data;
-          const sanitized = sanitizeStdout(rawStreamingText);
-          updateStreamingMessageText(activeStreamingMessageId, sanitized);
-          
-          // Reset stream timeout (long fallback timeout of 60 seconds)
-          if (streamTimeout) clearTimeout(streamTimeout);
-          streamTimeout = setTimeout(() => {
-            activeStreamingMessageId = null;
-          }, 60000);
+        // Stream stdout and stderr to the matching chat bubble for any live CLI session.
+        if (streamingMessageBySession[payload.session_id]) {
+          appendStreamingChunk(payload.session_id, payload.stream, payload.data);
         }
 
         // Auto scroll terminal logs & chat scroller
         setTimeout(() => {
-          const term = document.getElementById("terminal-screen");
-          if (term) term.scrollTop = term.scrollHeight;
+          document.querySelectorAll(".terminal-content").forEach((term) => {
+            term.scrollTop = term.scrollHeight;
+          });
 
           const chatScroller = document.querySelector(".chat-scroller");
           if (chatScroller) {
@@ -636,26 +1267,28 @@
       });
 
       // 3. Listen for CLI task completion
-      unlistenCliFinished = await listen("cli-finished", (event: any) => {
-        const session_id: any = event.payload;
-        if (session_id === "active-workspace-session") {
-          activeStreamingMessageId = null;
-          if (streamTimeout) {
-            clearTimeout(streamTimeout);
-            streamTimeout = null;
-          }
-        } else if (session_id.startsWith("task-session-")) {
+      unlistenCliFinished = await listen("cli-finished", async (event: any) => {
+        const finished = normalizeCliFinishedPayload(event.payload);
+        if (!finished) {
+          streamLogs = [...streamLogs, `[CLI] Ignored malformed cli-finished payload: ${JSON.stringify(event.payload)}`];
+          return;
+        }
+        const session_id = finished.sessionId;
+        if (session_id.startsWith("task-session-")) {
           const taskId = session_id.replace("task-session-", "");
           let finalStatus: 'active' | 'paused' | 'running' = 'active';
           tasks = tasks.map(t => {
             if (t.id === taskId) {
               finalStatus = t.schedule === 'once' ? 'paused' : 'active';
+              const resultText = finished.success
+                ? "Task finished successfully."
+                : `Task ${formatFinishedStatus(finished)}.`;
               return {
                 ...t,
                 status: finalStatus,
                 lastRun: Date.now(),
-                lastResult: 'success',
-                lastOutput: t.lastOutput + `\n[${new Date().toLocaleTimeString()}] Task finished successfully.\n`
+                lastResult: finished.success ? 'success' : 'failed',
+                lastOutput: t.lastOutput + `\n[${new Date().toLocaleTimeString()}] ${resultText}\n`
               };
             }
             return t;
@@ -663,29 +1296,61 @@
           invoke("update_task_status", { id: taskId, status: finalStatus }).catch(e => {
             console.error("Failed to update task status in SQLite:", e);
           });
-          streamLogs = [...streamLogs, `[TASK RUNNER] Task execution finished: ${taskId}`];
+          streamLogs = [...streamLogs, `[TASK RUNNER] Task execution ${formatFinishedStatus(finished)}: ${taskId}`];
+        } else {
+          streamLogs = [...streamLogs, `[CLI] Session ${session_id} ${formatFinishedStatus(finished)}`];
+          await finishStreamingSession(session_id, finished.success ? undefined : failureFallbackForFinished(finished));
         }
       });
 
       // 4. Listen for dynamic subagent spawning commands intercepted in active CLI streams
-      unlistenSpawnSubagent = await listen("spawn-subagent", (event: any) => {
+      unlistenSpawnSubagent = await listen("spawn-subagent", async (event: any) => {
         const payload: any = event.payload;
-        const saId = `sa-spawned-${Date.now()}`;
-        const provider = (payload.model || "claude").toLowerCase();
-        const specificModel = defaultProviderModels[provider] || (providerModelsMap[provider] ? providerModelsMap[provider][0] : "claude-sonnet-4.6");
-        
-        const newSa = {
-          id: saId,
-          name: payload.name,
-          role: payload.role,
-          model: provider,
-          specificModel: specificModel,
-          active: true,
-          cost: "$0.01"
-        };
-        
-        subagents = [...subagents, newSa];
-        addMessageToActiveConversation("Security Kernel", `🚀 Dynamic Subagent Spawned: "${payload.name}" (${payload.role}) utilizing model: ${provider.toUpperCase()} (${specificModel}) CLI`, 'system');
+        const agentKey = normalizeCanonicalAgentKey(payload.agent_key || payload.agentKey || payload.agent);
+        if (!agentKey) {
+          appendStreamLog(`[SUBAGENT] Rejected spawn: missing exact canonical agent key. Expected one of research, backend, frontend, verification.`);
+          return;
+        }
+
+        const parentSessionIdRaw = payload.parent_session_id || payload.parentSessionId;
+        if (typeof parentSessionIdRaw !== "string" || !parentSessionIdRaw.trim()) {
+          appendStreamLog(`[SUBAGENT] Rejected spawn: missing parent session id.`);
+          return;
+        }
+        const parentSessionId = parentSessionIdRaw.trim();
+        if (!canSessionSpawnSubagents(parentSessionId)) {
+          appendStreamLog(`[SUBAGENT] Ignored nested delegation from ${parentSessionId}; only the main orchestrator can spawn registry agents.`);
+          return;
+        }
+
+        const parentRunIdRaw = payload.parent_run_id || payload.parentRunId;
+        if (typeof parentRunIdRaw !== "string" || !parentRunIdRaw.trim()) {
+          appendStreamLog(`[SUBAGENT] Rejected spawn from ${parentSessionId}: missing parent run id.`);
+          return;
+        }
+        const parentRunId = parentRunIdRaw.trim();
+        const parentMeta = streamingMetaBySession[parentSessionId];
+        if (!parentMeta || parentMeta.runId !== parentRunId) {
+          appendStreamLog(`[SUBAGENT] Ignored stale delegation from ${parentSessionId}; run id no longer matches the active prompt.`);
+          return;
+        }
+
+        const registryAgent = subagents.find(sa => getSubagentRoleKey(sa) === agentKey);
+        if (!registryAgent) {
+          appendStreamLog(`[SUBAGENT] Rejected spawn: no configured registry entry for canonical agent "${agentKey}".`);
+          return;
+        }
+
+        if (hasDelegatedAgent(parentSessionId, agentKey)) {
+          appendStreamLog(`[SUBAGENT] Ignored duplicate delegation for exact ${agentKey}; that registry agent is already running for this prompt.`);
+          return;
+        }
+
+        markDelegatedAgent(parentSessionId, agentKey);
+        const conversationId = parentMeta?.conversationId || activeConversationId;
+        appendStreamLog(`[SUBAGENT] Delegating to exact ${agentKey}: ${registryAgent.model.toUpperCase()} (${registryAgent.specificModel})`);
+        const sourcePrompt = promptBySession[parentSessionId] || promptBySession[MAIN_SESSION_ID] || getLatestUserPrompt();
+        await launchSubagent(registryAgent, sourcePrompt, payload.task, conversationId || undefined, parentSessionId);
       });
 
       // 5. Fetch Rules parsed dynamically from C:\Users\User\Desktop\dev-rules\index.html
@@ -790,14 +1455,232 @@
     }
   }
 
+  function getLatestUserPrompt(): string {
+    const latestUserMessage = chatMessages.slice().reverse().find(m => m.type === "user");
+    return latestUserMessage ? latestUserMessage.text : "";
+  }
+
+  const canonicalAgentOrder: AgentKey[] = ["research", "backend", "frontend", "verification"];
+
+  function hasWordLike(text: string, pattern: RegExp): boolean {
+    return pattern.test(text);
+  }
+
+  function looksLikeWorkPrompt(promptText: string): boolean {
+    const lower = promptText.toLowerCase();
+    const trimmed = lower.trim();
+    if (!trimmed) return false;
+
+    if (
+      trimmed.includes("```") ||
+      trimmed.includes("[stdout]") ||
+      trimmed.includes("[stderr]") ||
+      trimmed.includes("[orchestrator]") ||
+      trimmed.includes("[rules gate]") ||
+      trimmed.includes("c:\\") ||
+      /\.(rs|svelte|ts|js|json|toml|md|html|css|mjs|cjs)\b/.test(trimmed) ||
+      /\b(npm|cargo|git|powershell|cmd|node|tauri)\b/.test(trimmed)
+    ) {
+      return true;
+    }
+
+    return hasWordLike(
+      trimmed,
+      /\b(agent|analyze|app|auth|backend|build|check|cli|code|component|create|debug|delegate|deploy|edit|error|file|fix|folder|frontend|implement|inspect|model|orchestrator|project|read|refactor|research|review|route|run|search|subagent|tauri|test|update|validate|verify|write)\b/
+    );
+  }
+
+  function findRoutedSubagentForPrompt(promptText: string): Subagent | null {
+    const lower = promptText.toLowerCase();
+    if (lower.includes("research agent") || lower.includes("researcher")) {
+      return subagents.find(sa => sa.id === "sa-1") || null;
+    }
+    if (lower.includes("backend coder agent") || lower.includes("backend coder")) {
+      return subagents.find(sa => sa.id === "sa-2b") || null;
+    }
+    if (lower.includes("frontend coder agent") || lower.includes("frontend coder")) {
+      return subagents.find(sa => sa.id === "sa-2f") || null;
+    }
+    if (lower.includes("verification agent") || lower.includes("verifier")) {
+      return subagents.find(sa => sa.id === "sa-3") || null;
+    }
+    return null;
+  }
+
+  function getRequestedAgentKeys(promptText: string): AgentKey[] {
+    const lower = promptText.toLowerCase();
+    const nonCasualWork = looksLikeWorkPrompt(promptText);
+    const wantsAgentDelegation = /\b(subagents?|agents?|delegate|delegation|spawn)\b/.test(lower);
+    const requested = new Set<AgentKey>();
+
+    if (!nonCasualWork && !wantsAgentDelegation) {
+      return [];
+    }
+
+    if (/\ball\b|\bevery\b|\bfull\b|\bcomplete\b/.test(lower) && wantsAgentDelegation) {
+      return canonicalAgentOrder;
+    }
+
+    if (nonCasualWork) {
+      requested.add("research");
+    }
+
+    const creationOrBuild = /\b(make|build|create|implement|add|write|generate|scaffold|app|site|game|feature|component|page|ui)\b/.test(lower);
+    const codeChange = /\b(fix|debug|repair|change|update|edit|refactor|wire|integrate|auth|routing|orchestrator|model|cli|database|db|state|storage|persistence)\b/.test(lower);
+    const frontendWork = /\b(frontend|front end|ui|ux|svelte|typescript|css|html|style|layout|component|page|screen|browser|app|site|game)\b/.test(lower);
+    const backendWork = /\b(backend|back end|server|api|rust|tauri|command|filesystem|database|db|sqlite|auth|cli|orchestrator|model|routing|state|storage|persistence|process)\b/.test(lower);
+    const verificationWork = /\b(verification|validation|verify|validate|tests?|checks?|smoke|build|cargo|npm|error|bug|debug|fix|regression)\b/.test(lower);
+    const analysisOnly = /\b(research|inspect|read|analyze|analysis|review|investigate|look at|figure out|what happened|why)\b/.test(lower);
+
+    if (/\bresearch\b|\bresearcher\b|\binspect\b|\bcodebase\b|\bread\b|\banalyze\b|\breview\b|\binvestigate\b/.test(lower)) {
+      requested.add("research");
+    }
+    if (creationOrBuild || backendWork || codeChange) {
+      requested.add("backend");
+    }
+    if (creationOrBuild || frontendWork) {
+      requested.add("frontend");
+    }
+    if (creationOrBuild || verificationWork || codeChange) {
+      requested.add("verification");
+    }
+
+    if (analysisOnly && requested.size === 1) {
+      requested.add("verification");
+    }
+
+    if (requested.size === 0 && (nonCasualWork || wantsAgentDelegation)) {
+      requested.add("research");
+    }
+
+    return canonicalAgentOrder.filter(key => requested.has(key));
+  }
+
+  function getDelegatedTask(agentKey: AgentKey): string {
+    if (agentKey === "research") {
+      return "Inspect the existing project and identify relevant files, architecture, constraints, and risks for the requested build.";
+    }
+    if (agentKey === "backend") {
+      return "Handle the backend, filesystem, Rust/Tauri, command execution, and data-flow work required by the requested build.";
+    }
+    if (agentKey === "frontend") {
+      return "Handle the frontend, Svelte, TypeScript, styling, and user-facing behavior required by the requested build.";
+    }
+    return "Run validation for the requested build, including relevant checks/tests, and report concrete failures or pass status.";
+  }
+
+  async function launchRequestedSubagents(
+    parentSessionId: string,
+    sourcePrompt: string,
+    reservedAgentKeys?: AgentKey[],
+    conversationId = activeConversationId
+  ) {
+    const requestedAgentKeys = reservedAgentKeys || reserveDelegatedAgents(parentSessionId, getRequestedAgentKeys(sourcePrompt));
+    if (requestedAgentKeys.length === 0 || !conversationId) return;
+
+    appendStreamLog(`[ORCHESTRATOR] Mandatory delegation: ${requestedAgentKeys.join(", ")}`);
+
+    for (const agentKey of requestedAgentKeys) {
+      const agent = getSubagentByRoleKey(agentKey);
+      if (!agent) {
+        appendStreamLog(`[SUBAGENT] Cannot delegate ${agentKey}: no configured registry entry.`);
+        continue;
+      }
+
+      appendStreamLog(`[SUBAGENT] Delegating to exact ${agentKey}: ${agent.model.toUpperCase()} (${agent.specificModel})`);
+      await launchSubagent(agent, sourcePrompt, getDelegatedTask(agentKey), conversationId, parentSessionId);
+    }
+  }
+
+  function getProviderModelsForPrompt(promptText: string): Record<string, string> {
+    const models: Record<string, string> = { ...defaultProviderModels };
+    const routedSubagent = findRoutedSubagentForPrompt(promptText);
+    if (routedSubagent) {
+      models[routedSubagent.model] = routedSubagent.specificModel;
+    }
+    return models;
+  }
+
+  function getProviderModelsForSubagent(sa: Subagent): Record<string, string> {
+    return {
+      ...defaultProviderModels,
+      [sa.model]: sa.specificModel
+    };
+  }
+
+  function buildSubagentPrompt(sa: Subagent, sourcePrompt: string, requestedTask?: string): string {
+    const taskLine = requestedTask && requestedTask.trim()
+      ? requestedTask.trim()
+      : `Help complete the original user request from your role: ${sa.role}.`;
+
+    return [
+      `You are ${sa.name}, an nTropy companion subagent.`,
+      `Assigned role: ${sa.role}.`,
+      `Specific task: ${taskLine}`,
+      "",
+      "Original user request:",
+      sourcePrompt,
+      "",
+      "Work only on your assigned slice. You are a worker, not the coordinator.",
+      "Do not delegate, do not spawn more subagents, and never print SPAWN_SUBAGENT.",
+      "Return concise, actionable output for the shared chat."
+    ].join("\n");
+  }
+
+  async function launchSubagent(sa: Subagent, sourcePrompt: string, requestedTask?: string, conversationId = activeConversationId, parentSessionId?: string) {
+    if (!conversationId) return;
+    if (hasLiveSubagentSession(sa.id)) {
+      const roleKey = getSubagentRoleKey(sa) || sa.id;
+      appendStreamLog(`[SUBAGENT] Ignored duplicate launch for ${roleKey}; that subagent is already running.`);
+      return;
+    }
+    const cleanSourcePrompt = sourcePrompt.trim();
+    if (!cleanSourcePrompt) {
+      await addMessageToConversation(conversationId, "Orchestrator", `No prompt is available for ${sa.name} yet. Send a chat prompt first, or type one in the input before running a subagent.`, 'system');
+      return;
+    }
+
+    const runSuffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const sessionId = `subagent-session-${sa.id}-${runSuffix}`;
+    const streamMsgId = `subagent-stream-${sa.id}-${runSuffix}`;
+    const subagentPrompt = buildSubagentPrompt(sa, cleanSourcePrompt, requestedTask);
+    const sender = `${sa.name} Subagent`;
+
+    setSubagentActive(sa.id, true);
+    await addMessageToConversation(conversationId, sender, "", 'agent', streamMsgId, false);
+    const runId = registerStreamingSession(sessionId, streamMsgId, subagentPrompt, sa.model, sa.specificModel, conversationId, sender, 'agent', sa.id, parentSessionId);
+
+    try {
+      await invoke("run_cli_prompt", {
+        sessionId,
+        runId,
+        model: sa.model,
+        specificModel: sa.specificModel,
+        prompt: subagentPrompt,
+        agentMappings: getAgentMappings(),
+        providerModels: getProviderModelsForSubagent(sa),
+        subagentModels: getSubagentModelRegistry()
+      });
+    } catch (e) {
+      updateStreamingMessageText(streamMsgId, `CLI Fail: ${e}`, conversationId);
+      await finishStreamingSession(sessionId, `CLI Fail: ${e}`);
+    }
+  }
+
+  async function runSubagentFromLatestUserMessage(sa: Subagent) {
+    const sourcePrompt = prompt.trim() || getLatestUserPrompt();
+    await launchSubagent(sa, sourcePrompt);
+  }
+
   async function sendPrompt() {
-    if (!prompt.trim() || !activeConversationId) return;
+    if (!prompt.trim() || !activeConversationId || activeStreamingMessageId) return;
     
+    const conversationId = activeConversationId;
     const currentPrompt = prompt;
     prompt = "";
 
     // Add User Message
-    addMessageToActiveConversation("User", currentPrompt, 'user');
+    await addMessageToConversation(conversationId, "User", currentPrompt, 'user');
 
     // Highlight any parsed dynamic rule triggers
     const triggerViolations: any = await invoke("check_rules_action", { 
@@ -806,21 +1689,18 @@
     });
     
     if (triggerViolations.length > 0) {
-      addMessageToActiveConversation("Rules Gate", `⚠️ [DEV-RULES WARNING]: Triggered rule constraint - ${triggerViolations[0].text}`, 'system');
+      streamLogs = [...streamLogs, `[RULES GATE] Triggered rule constraint - ${triggerViolations[0].text}`];
     }
 
     // Allocate streaming chat bubble for the agent response
-    const streamMsgId = `agent-stream-${Date.now()}`;
-    activeStreamingMessageId = streamMsgId;
-    rawStreamingText = "";
-
-    addMessageToActiveConversation(activeModel.toUpperCase() + " Agent", "", 'agent', streamMsgId);
-
-    // Clear any previous timeout
-    if (streamTimeout) {
-      clearTimeout(streamTimeout);
-      streamTimeout = null;
-    }
+    const runSuffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const streamMsgId = `agent-stream-${runSuffix}`;
+    const activeProvider = activeModel;
+    const activeSpecificModel = getSafeSpecificModel(activeProvider);
+    const sender = `${activeProvider.toUpperCase()} Agent`;
+    await addMessageToConversation(conversationId, sender, "", 'agent', streamMsgId, false);
+    const runId = registerStreamingSession(MAIN_SESSION_ID, streamMsgId, currentPrompt, activeProvider, activeSpecificModel, conversationId, sender);
+    const deterministicAgentKeys = reserveDelegatedAgents(MAIN_SESSION_ID, getRequestedAgentKeys(currentPrompt));
 
     // Auto-scroll after adding user message & placeholder
     setTimeout(() => {
@@ -833,58 +1713,74 @@
     try {
       // Execute global CLI subprocess
       await invoke("run_cli_prompt", {
-        sessionId: "active-workspace-session",
-        model: activeModel,
+        sessionId: MAIN_SESSION_ID,
+        runId,
+        model: activeProvider,
+        specificModel: activeSpecificModel,
         prompt: currentPrompt,
         agentMappings: getAgentMappings(),
-        providerModels: getProviderModels()
+        providerModels: getProviderModelsForPrompt(currentPrompt),
+        subagentModels: getSubagentModelRegistry()
       });
+      await launchRequestedSubagents(MAIN_SESSION_ID, currentPrompt, deterministicAgentKeys, conversationId);
     } catch (e) {
-      updateStreamingMessageText(streamMsgId, `CLI Fail: ${e}`);
-      activeStreamingMessageId = null;
+      updateStreamingMessageText(streamMsgId, `CLI Fail: ${e}`, conversationId);
+      await finishStreamingSession(MAIN_SESSION_ID, `CLI Fail: ${e}`);
     }
   }
 
   function handleModelSwitch(model: string) {
-    if (!activeConversationId) return;
-    conversations = conversations.map(c => {
-      if (c.id === activeConversationId) {
-        return {
-          ...c,
-          activeModel: model
-        };
-      }
-      return c;
-    });
+    if (!isKnownProvider(model)) return;
+    preferredChatModel = model;
+    if (activeConversationId) {
+      storedConversationModels = { ...storedConversationModels, [activeConversationId]: model };
+      conversations = conversations.map(c => {
+        if (c.id === activeConversationId) {
+          return {
+            ...c,
+            activeModel: model
+          };
+        }
+        return c;
+      });
+    }
+    saveModelPreferences();
+  }
+
+  function handleUnderlyingModelSwitch(provider: string, specificModel: string) {
+    if (!isKnownProvider(provider) || !isValidProviderModel(provider, specificModel)) return;
+    defaultProviderModels = {
+      ...defaultProviderModels,
+      [provider]: specificModel
+    };
+    saveModelPreferences();
   }
 
   function toggleSubagentModel(id: string, model: string) {
+    if (!isKnownProvider(model)) return;
     subagents = subagents.map(sa => {
       if (sa.id === id) {
-        const defaultSpecific = defaultProviderModels[model] || (providerModelsMap[model] ? providerModelsMap[model][0] : "");
+        const defaultSpecific = getSafeSpecificModel(model);
         return { ...sa, model, specificModel: defaultSpecific };
       }
       return sa;
     });
+    saveModelPreferences();
   }
 
   function toggleSubagentSpecificModel(id: string, specificModel: string) {
     subagents = subagents.map(sa => {
       if (sa.id === id) {
+        if (!isValidProviderModel(sa.model, specificModel)) return sa;
         return { ...sa, specificModel };
       }
       return sa;
     });
+    saveModelPreferences();
   }
 
   function getProviderModels(): Record<string, string> {
-    const models: Record<string, string> = { ...defaultProviderModels };
-    subagents.forEach(sa => {
-      if (sa.active) {
-        models[sa.model] = sa.specificModel;
-      }
-    });
-    return models;
+    return { ...defaultProviderModels };
   }
 
   function getAgentMappings(): Record<string, string> {
@@ -1128,10 +2024,10 @@
             <select 
               class="model-select-dropdown" 
               value={defaultProviderModels[activeModel]} 
-              onchange={(e: any) => defaultProviderModels[activeModel] = e.target.value}
+              onchange={(e: any) => handleUnderlyingModelSwitch(activeModel, e.target.value)}
             >
               {#each providerModelsMap[activeModel] || [] as specificOption}
-                <option value={specificOption}>{specificOption}</option>
+                <option value={specificOption}>{formatSpecificModelLabel(specificOption)}</option>
               {/each}
             </select>
             <span class="select-arrow">▼</span>
@@ -1153,6 +2049,20 @@
               </div>
             {/each}
 
+            <!-- Proof of Life active thinking indicator -->
+            {#if activeStreamingMessageId}
+              <div class="processing-loader-card">
+                <div class="loader-header">
+                  <span class="pulse-dot"></span>
+                  <span class="loader-title">ORCHESTRATOR ACTIVE PROCESSING THREAD</span>
+                </div>
+                <p class="loader-subtitle">Executing direct system execution through {activeModel.toUpperCase()} CLI...</p>
+                <div class="progress-bar-container">
+                  <div class="scanning-laser"></div>
+                </div>
+              </div>
+            {/if}
+
             <!-- Secure transaction card if pending -->
             {#if pendingApproval}
               <div class="transaction-card">
@@ -1171,10 +2081,13 @@
           <form class="input-form" onsubmit={(e) => { e.preventDefault(); sendPrompt(); }}>
             <input 
               type="text" 
-              placeholder="Type prompt here... (e.g. check index symbols, save skill, run build)" 
+              placeholder={activeStreamingMessageId ? "[Agent is actively executing. Thread locked...]" : "Type prompt here... (e.g. check index symbols, save skill, run build)"}
               bind:value={prompt}
+              disabled={!!activeStreamingMessageId}
             />
-            <button type="submit">Execute Action</button>
+            <button type="submit" disabled={!!activeStreamingMessageId}>
+              {activeStreamingMessageId ? "Executing..." : "Execute Action"}
+            </button>
           </form>
         </div>
       {:else if currentView === 'tasks'}
@@ -1302,6 +2215,34 @@
           </div>
         </div>
       {/if}
+      <div class="runtime-dock">
+        <div class="runtime-usage-strip">
+          <span class="runtime-label">Tokens</span>
+          {#each Object.values(tokenUsageByModel) as usage}
+            <span class="runtime-usage-chip">
+              <strong>{usage.provider.toUpperCase()}</strong>
+              <span>{usage.specificModel}</span>
+              <span>{formatTokens(usage.totalTokens)}</span>
+            </span>
+          {:else}
+            <span class="runtime-empty">No token reports yet.</span>
+          {/each}
+        </div>
+        <div class="terminal-panel inline-terminal">
+          <div class="terminal-header">
+            <span>Terminal Stdout Log</span>
+            <div class="terminal-header-actions">
+              <span class="term-status">ACTIVE WRAPPER</span>
+              <button class="terminal-action-btn" type="button" onclick={() => streamLogs = []}>Clear</button>
+            </div>
+          </div>
+          <div id="terminal-screen" class="terminal-content">
+            {#each streamLogs as log}
+              <div class="log-line">{log}</div>
+            {/each}
+          </div>
+        </div>
+      </div>
     </section>
 
     {#if showRightPanel}
@@ -1319,6 +2260,20 @@
             <div class="subagent-list">
               <div class="panel-header">
                 <h3>Active Subagent Registry</h3>
+              </div>
+              <div class="usage-panel">
+                <div class="usage-title">Tokens Used During Actions</div>
+                {#each Object.values(tokenUsageByModel) as usage}
+                  <div class="usage-row">
+                    <div>
+                      <div class="usage-model">{usage.provider.toUpperCase()} · {usage.specificModel}</div>
+                      <div class="usage-meta">{usage.actions} action{usage.actions === 1 ? '' : 's'} · last {formatTokens(usage.lastTokens)}</div>
+                    </div>
+                    <div class="usage-total">{formatTokens(usage.totalTokens)}</div>
+                  </div>
+                {:else}
+                  <div class="usage-empty">No token reports yet.</div>
+                {/each}
               </div>
               {#each subagents as sa}
                 <div class="subagent-card" class:active={sa.active}>
@@ -1343,10 +2298,13 @@
                       <span class="lbl" style="min-width: 32px;">Model:</span>
                       <select value={sa.specificModel} onchange={(e: any) => toggleSubagentSpecificModel(sa.id, e.target.value)} style="flex: 1;">
                         {#each providerModelsMap[sa.model] || [] as specificOption}
-                          <option value={specificOption}>{specificOption}</option>
+                          <option value={specificOption}>{formatSpecificModelLabel(specificOption)}</option>
                         {/each}
                       </select>
                     </div>
+                    <button class="sa-run-btn" onclick={() => runSubagentFromLatestUserMessage(sa)}>
+                      Run on Current Prompt
+                    </button>
                   </div>
                 </div>
               {/each}
@@ -1388,19 +2346,6 @@
               </div>
             </div>
           {/if}
-        </div>
-
-        <!-- CLI Output Panel moved to the side at the bottom of the right panel -->
-        <div class="terminal-panel side-terminal">
-          <div class="terminal-header">
-            <span>Terminal Stdout Log</span>
-            <span class="term-status">ACTIVE WRAPPER</span>
-          </div>
-          <div id="terminal-screen" class="terminal-content">
-            {#each streamLogs as log}
-              <div class="log-line">{log}</div>
-            {/each}
-          </div>
         </div>
       </aside>
     {/if}
@@ -1799,11 +2744,6 @@
     flex-shrink: 0;
   }
 
-  .project-conversation-link {
-    padding-left: 1.25rem;
-    margin-top: 0.1rem;
-  }
-
   .conv-btn {
     display: flex;
     align-items: center;
@@ -1950,9 +2890,11 @@
   /* Main Workspace Center Chat Pane */
   .main-panel {
     flex: 1;
+    min-width: 0;
     display: flex;
     flex-direction: column;
     background: var(--bg-chat);
+    overflow: hidden;
   }
 
   .model-selection-bar {
@@ -2159,6 +3101,57 @@
   }
 
   /* Subprocess Terminal logs */
+  .runtime-dock {
+    flex: 0 0 auto;
+    border-top: 1px solid var(--border-glass);
+    background: #101012;
+    padding: 0.6rem 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .runtime-usage-strip {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    min-height: 24px;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+
+  .runtime-label {
+    flex: 0 0 auto;
+    color: var(--text-muted);
+    font-size: 0.68rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .runtime-usage-chip {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    background: #18181a;
+    border: 1px solid var(--border-glass);
+    border-radius: 999px;
+    color: var(--text-muted);
+    font-size: 0.68rem;
+    padding: 0.2rem 0.5rem;
+  }
+
+  .runtime-usage-chip strong {
+    color: var(--text-primary);
+    font-size: 0.68rem;
+  }
+
+  .runtime-empty {
+    color: var(--text-muted);
+    font-size: 0.72rem;
+  }
+
   .terminal-panel {
     height: 160px;
     background: #09090b;
@@ -2181,8 +3174,30 @@
     color: var(--text-muted);
   }
 
+  .terminal-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+  }
+
   .term-status {
     color: var(--text-muted);
+  }
+
+  .terminal-action-btn {
+    background: #18181a;
+    border: 1px solid var(--border-glass);
+    border-radius: 4px;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 0.68rem;
+    font-weight: 700;
+    padding: 0.12rem 0.45rem;
+  }
+
+  .terminal-action-btn:hover {
+    border-color: var(--border-glass-bright);
+    color: var(--text-primary);
   }
 
   .terminal-content {
@@ -2199,12 +3214,8 @@
     white-space: pre-wrap;
   }
 
-  .side-terminal {
-    height: 200px;
-    background: #09090b;
-    border: none;
-    border-top: 1px solid var(--border-glass);
-    border-radius: 0;
+  .inline-terminal {
+    height: 150px;
     margin-top: 0;
   }
 
@@ -2254,6 +3265,118 @@
     border-color: #52525b;
   }
 
+  /* Proof of life loaders & animations */
+  .processing-loader-card {
+    background: linear-gradient(135deg, rgba(20, 20, 25, 0.7) 0%, rgba(10, 10, 12, 0.9) 100%);
+    border: 1px solid rgba(139, 92, 246, 0.2);
+    border-radius: 8px;
+    padding: 0.85rem 1rem;
+    margin-top: 0.75rem;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    animation: breathingGlow 3s infinite ease-in-out;
+  }
+
+  .loader-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.25rem;
+  }
+
+  .pulse-dot {
+    width: 8px;
+    height: 8px;
+    background-color: #8b5cf6;
+    border-radius: 50%;
+    box-shadow: 0 0 8px #8b5cf6, 0 0 15px #8b5cf6;
+    animation: dotPulse 1.2s infinite ease-in-out;
+  }
+
+  .loader-title {
+    font-size: 0.7rem;
+    font-family: var(--font-mono);
+    color: #a78bfa;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+  }
+
+  .loader-subtitle {
+    margin: 0 0 0.65rem 0;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+  }
+
+  .progress-bar-container {
+    width: 100%;
+    height: 3px;
+    background: rgba(255, 255, 255, 0.03);
+    border-radius: 999px;
+    overflow: hidden;
+    position: relative;
+    border: 1px solid rgba(255, 255, 255, 0.01);
+  }
+
+  .scanning-laser {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 30%;
+    background: linear-gradient(90deg, transparent 0%, #8b5cf6 50%, transparent 100%);
+    box-shadow: 0 0 10px #8b5cf6;
+    border-radius: 999px;
+    animation: laserScan 2s infinite ease-in-out;
+  }
+
+  @keyframes breathingGlow {
+    0%, 100% {
+      border-color: rgba(139, 92, 246, 0.15);
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+    }
+    50% {
+      border-color: rgba(139, 92, 246, 0.45);
+      box-shadow: 0 4px 25px rgba(139, 92, 246, 0.15);
+    }
+  }
+
+  @keyframes dotPulse {
+    0%, 100% {
+      transform: scale(0.8);
+      opacity: 0.5;
+    }
+    50% {
+      transform: scale(1.2);
+      opacity: 1;
+    }
+  }
+
+  @keyframes laserScan {
+    0% {
+      left: -30%;
+    }
+    100% {
+      left: 100%;
+    }
+  }
+
+  /* Enhancing active subagent card glowing border and pulse */
+  .subagent-card.active {
+    border-color: rgba(16, 185, 129, 0.35) !important;
+    box-shadow: 0 0 8px rgba(16, 185, 129, 0.05);
+    animation: activeAgentPulse 4s infinite ease-in-out;
+  }
+
+  @keyframes activeAgentPulse {
+    0%, 100% {
+      border-color: rgba(16, 185, 129, 0.25);
+      box-shadow: 0 0 8px rgba(16, 185, 129, 0.03);
+    }
+    50% {
+      border-color: rgba(16, 185, 129, 0.6);
+      box-shadow: 0 0 12px rgba(16, 185, 129, 0.15);
+    }
+  }
+
   /* Right Control Sidebars */
   .tab-bar {
     display: flex;
@@ -2296,6 +3419,52 @@
     border-radius: 6px;
     padding: 0.65rem;
     transition: all 0.15s ease;
+  }
+
+  .usage-panel {
+    background: #121214;
+    border: 1px solid var(--border-glass);
+    border-radius: 6px;
+    padding: 0.65rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .usage-title {
+    font-size: 0.68rem;
+    font-weight: 800;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .usage-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.65rem;
+    border-top: 1px solid rgba(255, 255, 255, 0.04);
+    padding-top: 0.45rem;
+  }
+
+  .usage-model {
+    font-size: 0.72rem;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  .usage-meta,
+  .usage-empty {
+    font-size: 0.68rem;
+    color: var(--text-muted);
+  }
+
+  .usage-total {
+    font-family: var(--font-mono);
+    font-size: 0.76rem;
+    color: #d4d4d8;
+    white-space: nowrap;
   }
 
   .subagent-card.active {
@@ -2354,6 +3523,24 @@
 
   .sa-controls select:hover {
     border-color: var(--border-glass-bright);
+  }
+
+  .sa-run-btn {
+    width: 100%;
+    background: #27272a;
+    border: 1px solid var(--border-glass-bright);
+    color: var(--text-primary);
+    border-radius: 5px;
+    padding: 0.38rem 0.55rem;
+    font-size: 0.72rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .sa-run-btn:hover {
+    background: #3f3f46;
+    border-color: #52525b;
   }
 
 
@@ -2594,6 +3781,7 @@
   /* ========================================== */
   .tasks-dashboard {
     flex: 1;
+    min-height: 0;
     display: flex;
     flex-direction: column;
     padding: 1.5rem;

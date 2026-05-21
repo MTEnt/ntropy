@@ -1,8 +1,8 @@
 [package]
-name = "tauri-app"
+name = "ntropy-local-automation"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Full-permission local AI automation harness for installed model CLIs."
+authors = []
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -36,6 +36,5 @@ rfd = "0.15"
 async-sqlite = { version = "0.5", default-features = false, features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
-
 
 
