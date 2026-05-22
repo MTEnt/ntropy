@@ -7,6 +7,7 @@ use cli_mediator::{AgentModelSelection, CliMediator, PromptRequest};
 use rules_engine::{Rule, RulesEngine, RulesManifest};
 use symbol_indexer::{FileSymbols, SymbolIndexer};
 
+use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use tauri::{AppHandle, Manager, State};
@@ -524,13 +525,54 @@ fn walk_dir_recursive(root: &Path, current: &Path, acc: &mut Vec<String>) -> Res
     Ok(())
 }
 
+fn initial_workspace_root(app: &tauri::App) -> PathBuf {
+    if let Some(path) = env_workspace_root() {
+        return path;
+    }
+
+    if let Ok(current_dir) = env::current_dir() {
+        let current_dir = fs::canonicalize(&current_dir).unwrap_or(current_dir);
+        if looks_like_project_root(&current_dir) {
+            return current_dir;
+        }
+        if let Some(parent) = current_dir.parent() {
+            if looks_like_project_root(parent) {
+                return parent.to_path_buf();
+            }
+        }
+    }
+
+    match app.path().app_data_dir() {
+        Ok(path) => path.join("workspace"),
+        Err(_) => env::temp_dir().join("ntropy-workspace"),
+    }
+}
+
+fn env_workspace_root() -> Option<PathBuf> {
+    let raw = env::var_os("NTROPY_WORKSPACE_ROOT")?;
+    if raw.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(raw);
+    if path.exists() {
+        fs::canonicalize(&path).ok()
+    } else {
+        Some(path)
+    }
+}
+
+fn looks_like_project_root(path: &Path) -> bool {
+    path.join("package.json").exists()
+        || path.join("src-tauri").exists()
+        || path.join(".git").exists()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            // Root paths based on Desktop conventions
-            let workspace_root = PathBuf::from(r"C:\Users\User\Desktop\auto-os");
+            let workspace_root = initial_workspace_root(app);
 
             // Ensure .agents exists
             let agents_dir = workspace_root.join(".agents");

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -172,318 +174,12 @@ impl CliMediator {
             final_model, session_id, workspace_root
         );
 
-        let mut child = if cfg!(target_os = "windows") {
-            let mut spawned = None;
-
-            // Try spawning direct native executable first to bypass cmd.exe and avoid escaping bugs
-            match final_model.as_str() {
-                "claude" => {
-                    let direct_path = r"C:\Users\User\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe";
-                    let mut cmd = Command::new(direct_path);
-                    cmd.current_dir(&workspace_root)
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped());
-
-                    let mut args = vec![
-                        "--print",
-                        "--dangerously-skip-permissions",
-                        "--permission-mode",
-                        "bypassPermissions",
-                    ];
-                    if let Some(ref m) = specific_model {
-                        args.push("--model");
-                        args.push(m);
-                        cmd.env("CLAUDE_MODEL", m);
-                        cmd.env("LLM_MODEL", m);
-                    }
-                    cmd.args(&args);
-
-                    if let Ok(c) = cmd.spawn() {
-                        println!("Direct claude.exe spawned successfully.");
-                        spawned = Some(c);
-                    }
-                }
-                "grok" => {
-                    let direct_path = r"C:\Users\User\.grok\bin\grok.exe";
-                    let mut cmd = Command::new(direct_path);
-                    cmd.current_dir(&workspace_root)
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped());
-
-                    let mut args =
-                        vec!["--always-approve", "--permission-mode", "bypassPermissions"];
-                    if let Some(ref m) = specific_model {
-                        args.push("-m");
-                        args.push(m);
-                        cmd.env("GROK_MODEL", m);
-                        cmd.env("LLM_MODEL", m);
-                    }
-                    args.push("-p");
-                    args.push(&prompt_with_harness);
-                    cmd.args(&args);
-
-                    if let Ok(c) = cmd.spawn() {
-                        println!("Direct grok.exe spawned successfully.");
-                        spawned = Some(c);
-                    }
-                }
-                "codex" => {
-                    let direct_path = r"C:\Users\User\AppData\Roaming\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\codex\codex.exe";
-                    let mut cmd = Command::new(direct_path);
-                    cmd.current_dir(&workspace_root)
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped());
-
-                    if let Some(ref m) = specific_model {
-                        cmd.env("OPENAI_MODEL", m);
-                        cmd.env("LLM_MODEL", m);
-                    }
-
-                    let mut args = vec![
-                        "exec",
-                        "--ignore-user-config",
-                        "--disable",
-                        "plugins",
-                        "--disable",
-                        "remote_plugin",
-                        "--disable",
-                        "shell_snapshot",
-                        "-c",
-                        "model_reasoning_effort=\"xhigh\"",
-                    ];
-                    if let Some(ref m) = specific_model {
-                        args.push("--model");
-                        args.push(m);
-                    }
-                    args.push("--skip-git-repo-check");
-                    args.push("--dangerously-bypass-approvals-and-sandbox");
-                    args.push("-");
-
-                    if let Ok(c) = cmd.args(&args).spawn() {
-                        println!("Direct codex.exe spawned successfully with full permissions.");
-                        spawned = Some(c);
-                    }
-                }
-                "gemini" => {
-                    let script_path = r"C:\Users\User\AppData\Roaming\npm\node_modules\@google\gemini-cli\bundle\gemini.js";
-                    let mut cmd = Command::new("node");
-                    cmd.current_dir(&workspace_root)
-                        .arg(script_path)
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped());
-
-                    if let Some(ref m) = specific_model {
-                        cmd.env("GEMINI_MODEL", m);
-                        cmd.env("LLM_MODEL", m);
-                    }
-
-                    let mut args = vec!["--skip-trust", "--approval-mode", "yolo"];
-                    if let Some(ref m) = specific_model {
-                        args.push("--model");
-                        args.push(m);
-                    }
-                    args.push("--prompt");
-                    args.push(&prompt_with_harness);
-                    cmd.args(&args);
-
-                    if let Ok(c) = cmd.spawn() {
-                        println!("Direct gemini node entrypoint spawned successfully.");
-                        spawned = Some(c);
-                    }
-                }
-                _ => {}
-            }
-
-            // Shell-free fallback. Never route prompt text through cmd.exe.
-            if spawned.is_none() {
-                println!(
-                    "Falling back to shell-free executable spawn for model: {}",
-                    final_model
-                );
-                let mut cmd = match final_model.as_str() {
-                    "claude" => Command::new(
-                        r"C:\Users\User\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe",
-                    ),
-                    "grok" => Command::new(r"C:\Users\User\.grok\bin\grok.exe"),
-                    "codex" => Command::new(
-                        r"C:\Users\User\AppData\Roaming\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\codex\codex.exe",
-                    ),
-                    "gemini" => {
-                        let mut node_cmd = Command::new("node");
-                        node_cmd.arg(r"C:\Users\User\AppData\Roaming\npm\node_modules\@google\gemini-cli\bundle\gemini.js");
-                        node_cmd
-                    }
-                    _ => {
-                        return Err(format!("Unsupported model/CLI: {}", final_model));
-                    }
-                };
-                cmd.current_dir(&workspace_root);
-
-                if let Some(ref m) = specific_model {
-                    cmd.env("CLAUDE_MODEL", m);
-                    cmd.env("GEMINI_MODEL", m);
-                    cmd.env("GROK_MODEL", m);
-                    cmd.env("OPENAI_MODEL", m);
-                    cmd.env("LLM_MODEL", m);
-                }
-
-                match final_model.as_str() {
-                    "claude" => {
-                        let mut args = vec![
-                            "--print",
-                            "--dangerously-skip-permissions",
-                            "--permission-mode",
-                            "bypassPermissions",
-                        ];
-                        if let Some(ref m) = specific_model {
-                            args.push("--model");
-                            args.push(m);
-                        }
-                        cmd.args(&args);
-                    }
-                    "grok" => {
-                        let mut args =
-                            vec!["--always-approve", "--permission-mode", "bypassPermissions"];
-                        if let Some(ref m) = specific_model {
-                            args.push("-m");
-                            args.push(m);
-                        }
-                        args.push("-p");
-                        args.push(&prompt_with_harness);
-                        cmd.args(&args);
-                    }
-                    "codex" => {
-                        let mut args = vec![
-                            "exec",
-                            "--ignore-user-config",
-                            "--disable",
-                            "plugins",
-                            "--disable",
-                            "remote_plugin",
-                            "--disable",
-                            "shell_snapshot",
-                            "-c",
-                            "model_reasoning_effort=\"xhigh\"",
-                            "--skip-git-repo-check",
-                            "--dangerously-bypass-approvals-and-sandbox",
-                        ];
-                        if let Some(ref m) = specific_model {
-                            args.push("--model");
-                            args.push(m);
-                        }
-                        args.push("-");
-                        cmd.args(&args);
-                    }
-                    "gemini" => {
-                        let mut args = vec!["--skip-trust", "--approval-mode", "yolo"];
-                        if let Some(ref m) = specific_model {
-                            args.push("--model");
-                            args.push(m);
-                        }
-                        args.push("--prompt");
-                        args.push(&prompt_with_harness);
-                        cmd.args(&args);
-                    }
-                    _ => {
-                        return Err(format!("Unsupported model/CLI: {}", final_model));
-                    }
-                }
-                cmd.stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .map_err(|e| format!("Failed to spawn shell-free fallback: {}", e))?
-            } else {
-                spawned.unwrap()
-            }
-        } else {
-            // Non-windows fallback
-            let mut cmd = Command::new(match final_model.as_str() {
-                "claude" => "claude",
-                "gemini" => "gemini",
-                "grok" => "grok",
-                "codex" => "codex",
-                _ => return Err(format!("Unsupported model/CLI: {}", final_model)),
-            });
-            cmd.current_dir(&workspace_root);
-
-            if let Some(ref m) = specific_model {
-                cmd.env("CLAUDE_MODEL", m);
-                cmd.env("GEMINI_MODEL", m);
-                cmd.env("GROK_MODEL", m);
-                cmd.env("OPENAI_MODEL", m);
-                cmd.env("LLM_MODEL", m);
-            }
-
-            match final_model.as_str() {
-                "claude" => {
-                    let mut args = vec![
-                        "--print",
-                        "--dangerously-skip-permissions",
-                        "--permission-mode",
-                        "bypassPermissions",
-                    ];
-                    if let Some(ref m) = specific_model {
-                        args.push("--model");
-                        args.push(m);
-                    }
-                    cmd.args(&args);
-                }
-                "grok" => {
-                    let mut args =
-                        vec!["--always-approve", "--permission-mode", "bypassPermissions"];
-                    if let Some(ref m) = specific_model {
-                        args.push("-m");
-                        args.push(m);
-                    }
-                    args.push("-p");
-                    args.push(&prompt_with_harness);
-                    cmd.args(&args);
-                }
-                "codex" => {
-                    let mut args = vec![
-                        "exec",
-                        "--ignore-user-config",
-                        "--disable",
-                        "plugins",
-                        "--disable",
-                        "remote_plugin",
-                        "--disable",
-                        "shell_snapshot",
-                        "-c",
-                        "model_reasoning_effort=\"xhigh\"",
-                        "--skip-git-repo-check",
-                        "--dangerously-bypass-approvals-and-sandbox",
-                    ];
-                    if let Some(ref m) = specific_model {
-                        args.push("--model");
-                        args.push(m);
-                    }
-                    args.push("-");
-                    cmd.args(&args);
-                }
-                "gemini" => {
-                    let mut args = vec!["--skip-trust", "--approval-mode", "yolo"];
-                    if let Some(ref m) = specific_model {
-                        args.push("--model");
-                        args.push(m);
-                    }
-                    args.push("--prompt");
-                    args.push(&prompt_with_harness);
-                    cmd.args(&args);
-                }
-                _ => {}
-            }
-            cmd.stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|e| format!("Failed to spawn CLI: {}", e))?
-        };
+        let mut child = spawn_provider_cli(
+            &final_model,
+            specific_model.as_deref(),
+            &prompt_with_harness,
+            &workspace_root,
+        )?;
 
         // If stdin is piped, write the prompt to it and immediately close it
         if let Some(mut stdin) = child.stdin.take() {
@@ -678,6 +374,359 @@ impl CliMediator {
             Err(format!("No active CLI session found for '{}'", session_id))
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct CliLaunchCandidate {
+    program: OsString,
+    pre_args: Vec<OsString>,
+    label: String,
+}
+
+impl CliLaunchCandidate {
+    fn command(command: &str) -> Self {
+        Self {
+            program: OsString::from(command),
+            pre_args: Vec::new(),
+            label: command.to_string(),
+        }
+    }
+
+    fn program_path(path: PathBuf) -> Self {
+        let label = path.to_string_lossy().to_string();
+        Self {
+            program: path.into_os_string(),
+            pre_args: Vec::new(),
+            label,
+        }
+    }
+
+    fn node_script(script_path: PathBuf) -> Self {
+        let label = format!("node {}", script_path.to_string_lossy());
+        Self {
+            program: OsString::from("node"),
+            pre_args: vec![script_path.into_os_string()],
+            label,
+        }
+    }
+}
+
+fn spawn_provider_cli(
+    provider: &str,
+    specific_model: Option<&str>,
+    prompt_with_harness: &str,
+    workspace_root: &Path,
+) -> Result<Child, String> {
+    let candidates = cli_launch_candidates(provider)?;
+    let path_env = augmented_path_env();
+    let mut attempts = Vec::new();
+
+    for candidate in candidates {
+        let mut cmd = Command::new(&candidate.program);
+        cmd.current_dir(workspace_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        if let Some(ref path) = path_env {
+            cmd.env("PATH", path);
+        }
+        cmd.args(&candidate.pre_args);
+        apply_model_env(&mut cmd, specific_model);
+        apply_provider_args(&mut cmd, provider, specific_model, prompt_with_harness)?;
+
+        match cmd.spawn() {
+            Ok(child) => {
+                println!(
+                    "Spawned {} CLI using {} on {}.",
+                    provider,
+                    candidate.label,
+                    std::env::consts::OS
+                );
+                return Ok(child);
+            }
+            Err(err) => attempts.push(format!("{} ({})", candidate.label, err)),
+        }
+    }
+
+    let provider_env = format!("NTROPY_{}_BIN", provider.to_ascii_uppercase());
+    let gemini_hint = if provider == "gemini" {
+        " or NTROPY_GEMINI_JS"
+    } else {
+        ""
+    };
+    Err(format!(
+        "Failed to spawn {} CLI on {}. Tried: {}. Install the CLI on PATH or set {}{}.",
+        provider,
+        std::env::consts::OS,
+        attempts.join("; "),
+        provider_env,
+        gemini_hint
+    ))
+}
+
+fn apply_model_env(cmd: &mut Command, specific_model: Option<&str>) {
+    if let Some(model) = specific_model {
+        cmd.env("CLAUDE_MODEL", model);
+        cmd.env("GEMINI_MODEL", model);
+        cmd.env("GROK_MODEL", model);
+        cmd.env("OPENAI_MODEL", model);
+        cmd.env("LLM_MODEL", model);
+    }
+}
+
+fn apply_provider_args(
+    cmd: &mut Command,
+    provider: &str,
+    specific_model: Option<&str>,
+    prompt_with_harness: &str,
+) -> Result<(), String> {
+    match provider {
+        "claude" => {
+            cmd.args([
+                "--print",
+                "--dangerously-skip-permissions",
+                "--permission-mode",
+                "bypassPermissions",
+            ]);
+            if let Some(model) = specific_model {
+                cmd.args(["--model", model]);
+            }
+        }
+        "grok" => {
+            cmd.args(["--always-approve", "--permission-mode", "bypassPermissions"]);
+            if let Some(model) = specific_model {
+                cmd.args(["-m", model]);
+            }
+            cmd.args(["-p", prompt_with_harness]);
+        }
+        "codex" => {
+            cmd.args([
+                "exec",
+                "--ignore-user-config",
+                "--disable",
+                "plugins",
+                "--disable",
+                "remote_plugin",
+                "--disable",
+                "shell_snapshot",
+                "-c",
+                "model_reasoning_effort=\"xhigh\"",
+            ]);
+            if let Some(model) = specific_model {
+                cmd.args(["--model", model]);
+            }
+            cmd.args([
+                "--skip-git-repo-check",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-",
+            ]);
+        }
+        "gemini" => {
+            cmd.args(["--skip-trust", "--approval-mode", "yolo"]);
+            if let Some(model) = specific_model {
+                cmd.args(["--model", model]);
+            }
+            cmd.args(["--prompt", prompt_with_harness]);
+        }
+        _ => return Err(format!("Unsupported model/CLI: {}", provider)),
+    }
+    Ok(())
+}
+
+fn cli_launch_candidates(provider: &str) -> Result<Vec<CliLaunchCandidate>, String> {
+    if !is_supported_provider(provider) {
+        return Err(format!("Unsupported model/CLI: {}", provider));
+    }
+
+    let mut candidates = Vec::new();
+    push_env_candidate(&mut candidates, provider);
+
+    if provider == "gemini" {
+        if let Some(script) = non_empty_env_path("NTROPY_GEMINI_JS") {
+            candidates.push(CliLaunchCandidate::node_script(script));
+        }
+    }
+
+    push_platform_candidates(&mut candidates, provider);
+    push_path_candidates(&mut candidates, provider);
+
+    Ok(candidates)
+}
+
+fn push_env_candidate(candidates: &mut Vec<CliLaunchCandidate>, provider: &str) {
+    let env_name = format!("NTROPY_{}_BIN", provider.to_ascii_uppercase());
+    if let Some(path) = non_empty_env_path(&env_name) {
+        candidates.push(CliLaunchCandidate::program_path(path));
+    }
+}
+
+fn push_platform_candidates(candidates: &mut Vec<CliLaunchCandidate>, provider: &str) {
+    if cfg!(target_os = "windows") {
+        if let Some(appdata) = non_empty_env_path("APPDATA") {
+            match provider {
+                "claude" => push_existing_program(
+                    candidates,
+                    appdata
+                        .join("npm")
+                        .join("node_modules")
+                        .join("@anthropic-ai")
+                        .join("claude-code")
+                        .join("bin")
+                        .join("claude.exe"),
+                ),
+                "codex" => push_existing_program(
+                    candidates,
+                    appdata
+                        .join("npm")
+                        .join("node_modules")
+                        .join("@openai")
+                        .join("codex")
+                        .join("node_modules")
+                        .join("@openai")
+                        .join("codex-win32-x64")
+                        .join("vendor")
+                        .join("x86_64-pc-windows-msvc")
+                        .join("codex")
+                        .join("codex.exe"),
+                ),
+                "gemini" => push_existing_node_script(
+                    candidates,
+                    appdata
+                        .join("npm")
+                        .join("node_modules")
+                        .join("@google")
+                        .join("gemini-cli")
+                        .join("bundle")
+                        .join("gemini.js"),
+                ),
+                _ => {}
+            }
+        }
+
+        if provider == "grok" {
+            if let Some(profile) = non_empty_env_path("USERPROFILE") {
+                push_existing_program(
+                    candidates,
+                    profile.join(".grok").join("bin").join("grok.exe"),
+                );
+            }
+        }
+        return;
+    }
+
+    if let Some(home) = home_dir() {
+        match provider {
+            "grok" => {
+                push_existing_program(candidates, home.join(".grok").join("bin").join("grok"))
+            }
+            "gemini" => {
+                for root in npm_global_roots(&home) {
+                    push_existing_node_script(
+                        candidates,
+                        root.join("lib")
+                            .join("node_modules")
+                            .join("@google")
+                            .join("gemini-cli")
+                            .join("bundle")
+                            .join("gemini.js"),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn push_path_candidates(candidates: &mut Vec<CliLaunchCandidate>, provider: &str) {
+    candidates.push(CliLaunchCandidate::command(provider));
+
+    if cfg!(target_os = "windows") {
+        candidates.push(CliLaunchCandidate::command(&format!("{}.exe", provider)));
+        candidates.push(CliLaunchCandidate::command(&format!("{}.cmd", provider)));
+    }
+}
+
+fn push_existing_program(candidates: &mut Vec<CliLaunchCandidate>, path: PathBuf) {
+    if path.exists() {
+        candidates.push(CliLaunchCandidate::program_path(path));
+    }
+}
+
+fn push_existing_node_script(candidates: &mut Vec<CliLaunchCandidate>, script_path: PathBuf) {
+    if script_path.exists() {
+        candidates.push(CliLaunchCandidate::node_script(script_path));
+    }
+}
+
+fn non_empty_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
+        .map(PathBuf::from)
+}
+
+fn npm_global_roots(home: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![home.join(".npm-global")];
+    if cfg!(target_os = "macos") {
+        roots.push(PathBuf::from("/opt/homebrew"));
+        roots.push(PathBuf::from("/usr/local"));
+    } else {
+        roots.push(PathBuf::from("/usr/local"));
+    }
+    roots
+}
+
+fn augmented_path_env() -> Option<OsString> {
+    let mut paths = common_bin_dirs()
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+
+    if let Some(existing_path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing_path));
+    }
+
+    std::env::join_paths(paths).ok()
+}
+
+fn common_bin_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    if let Some(appdata) = non_empty_env_path("APPDATA") {
+        dirs.push(appdata.join("npm"));
+    }
+    if let Some(profile) = non_empty_env_path("USERPROFILE") {
+        dirs.push(profile.join(".grok").join("bin"));
+        dirs.push(profile.join(".cargo").join("bin"));
+        dirs.push(profile.join(".local").join("bin"));
+    }
+    if let Some(home) = home_dir() {
+        dirs.push(home.join(".grok").join("bin"));
+        dirs.push(home.join(".cargo").join("bin"));
+        dirs.push(home.join(".local").join("bin"));
+        dirs.push(home.join(".npm-global").join("bin"));
+        dirs.push(home.join(".bun").join("bin"));
+    }
+
+    if cfg!(target_os = "macos") {
+        dirs.push(PathBuf::from("/opt/homebrew/bin"));
+        dirs.push(PathBuf::from("/usr/local/bin"));
+        dirs.push(PathBuf::from("/usr/bin"));
+        dirs.push(PathBuf::from("/bin"));
+    } else if cfg!(target_os = "linux") {
+        dirs.push(PathBuf::from("/usr/local/bin"));
+        dirs.push(PathBuf::from("/usr/bin"));
+        dirs.push(PathBuf::from("/bin"));
+    }
+
+    dirs
 }
 
 fn monitor_child_process(

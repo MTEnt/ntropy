@@ -1,6 +1,6 @@
 # nTropy
 
-nTropy is a Windows-first local desktop control panel for running installed AI coding CLIs against a selected workspace. It wraps a Svelte 5 interface in Tauri 2, stores project state in local SQLite, indexes source files for navigation, and launches Claude, Gemini, Grok, or Codex child processes with broad local permissions.
+nTropy is a cross-platform local desktop control panel for running installed AI coding CLIs against a selected workspace. It wraps a Svelte 5 interface in Tauri 2, stores project state in local SQLite, indexes source files for navigation, and launches Claude, Gemini, Grok, or Codex child processes with broad local permissions on Windows, macOS, and Linux.
 
 It is not an AI provider, hosted agent platform, or sandbox. nTropy is an orchestration shell around provider CLIs that are already installed and authenticated on the machine.
 
@@ -41,6 +41,7 @@ The product goal is direct local control: choose the CLI, choose the model, choo
 - Each project gets local runtime state under `.agents/nentropy.db`.
 - Recent projects are remembered in browser local storage.
 - The left sidebar shows projects, conversations, and active project files.
+- Startup uses `NTROPY_WORKSPACE_ROOT` when set, then a detected development project root, then the operating system's app-data workspace.
 
 Opening an existing folder can therefore mutate that folder by adding the project scaffolding above. That is intentional current behavior.
 
@@ -154,7 +155,14 @@ Current high-permission flags include:
 
 Claude and Codex receive prompts through stdin. Grok and Gemini receive prompts as command arguments.
 
-On Windows, nTropy tries direct user-specific executable paths first and then uses shell-free fallback executable paths. On non-Windows platforms, the implementation falls back to generic executable names from `PATH`.
+nTropy resolves provider CLIs in a platform-aware order:
+
+- Provider-specific env var overrides first: `NTROPY_CLAUDE_BIN`, `NTROPY_GEMINI_BIN`, `NTROPY_GROK_BIN`, and `NTROPY_CODEX_BIN`.
+- Gemini JS entrypoint override: `NTROPY_GEMINI_JS`.
+- Known user-local install paths for the current OS, including Windows npm/global paths, Grok's user bin folder, common macOS Homebrew paths, common Linux paths, and npm-global folders.
+- The normal command names from `PATH`, such as `claude`, `gemini`, `grok`, and `codex`.
+
+The backend also augments `PATH` with common user bin folders before spawning, which helps macOS/Linux GUI launches find CLIs installed through Homebrew, npm global installs, Cargo, Bun, or user-local bin directories.
 
 Use nTropy only with folders and accounts where this level of local automation is acceptable.
 
@@ -342,7 +350,7 @@ Install and authenticate the provider CLIs you plan to use:
 - Grok CLI, available as `grok`.
 - Codex CLI, available as `codex`.
 
-On Windows, the app currently assumes the provider CLIs are installed in the expected user-local locations used by the backend, with fallback to shell-free executable spawning. If a provider fails to launch, verify the installed CLI path, login state, non-interactive mode support, and model availability.
+On Windows, macOS, and Linux, nTropy can use either PATH-resolved CLI names or explicit env var overrides. If a provider fails to launch, verify the installed CLI path, login state, non-interactive mode support, and model availability.
 
 ## Running
 
