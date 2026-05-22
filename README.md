@@ -95,7 +95,7 @@ Every prompt has an active provider selected in the UI. The backend then applies
 - Prompts mentioning `verification agent` or `verifier` route to the verification mapping, defaulting to Gemini.
 - Otherwise, the selected UI provider is used.
 
-Provider mappings and specific model selections are passed from the UI into the backend. The UI offers preset model names, but availability still depends on the installed CLI version, account access, and provider-side support.
+Provider mappings and specific model selections are passed from the UI into the backend. The UI offers preset model names, but availability still depends on the installed CLI version, account access, and provider-side support. Gemini options mirror the Gemini CLI model picker: `auto-gemini-3`, `auto-gemini-2.5`, Gemini 3.1/3 preview models, Gemini 2.5 models, and the Gemma local-routing entries exposed by the installed CLI.
 
 For Codex child processes, nTropy also passes `--ignore-user-config --disable plugins --disable remote_plugin --disable shell_snapshot`. Auth still comes from the normal Codex login, but spawned runs do not inherit remote MCP/plugin OAuth configuration from the user's global Codex config. That keeps nTropy runs focused on the selected provider/model instead of trying to warm unrelated Codex-owned connectors.
 

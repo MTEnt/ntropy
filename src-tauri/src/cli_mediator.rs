@@ -1053,7 +1053,16 @@ fn is_known_model_for_provider(provider: &str, model: &str) -> bool {
         ),
         "gemini" => matches!(
             model,
-            "gemini-2.5-flash" | "gemini-2.5-pro" | "gemini-2.5-flash-lite"
+            "auto-gemini-3"
+                | "auto-gemini-2.5"
+                | "gemini-3.1-pro-preview"
+                | "gemini-3-flash-preview"
+                | "gemini-3.1-flash-lite-preview"
+                | "gemini-2.5-pro"
+                | "gemini-2.5-flash"
+                | "gemini-2.5-flash-lite"
+                | "gemma-4-31b-it"
+                | "gemma-4-26b-a4b-it"
         ),
         "grok" => matches!(model, "grok-build"),
         "codex" => matches!(model, "gpt-5.5" | "gpt-5.3-codex" | "o3-pro" | "o3"),

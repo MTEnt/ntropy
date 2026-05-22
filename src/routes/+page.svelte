@@ -897,14 +897,26 @@
   // Model mapping configuration
   const providerModelsMap: Record<string, string[]> = {
     claude: ["provider-default", "claude-opus-4.7", "claude-sonnet-4.6", "claude-haiku-4.5"],
-    gemini: ["provider-default", "gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite"],
+    gemini: [
+      "provider-default",
+      "auto-gemini-3",
+      "auto-gemini-2.5",
+      "gemini-3.1-pro-preview",
+      "gemini-3-flash-preview",
+      "gemini-3.1-flash-lite-preview",
+      "gemini-2.5-pro",
+      "gemini-2.5-flash",
+      "gemini-2.5-flash-lite",
+      "gemma-4-31b-it",
+      "gemma-4-26b-a4b-it"
+    ],
     grok: ["grok-build"],
     codex: ["provider-default", "gpt-5.5", "gpt-5.3-codex", "o3-pro", "o3"]
   };
 
   let defaultProviderModels = $state<Record<string, string>>({
     claude: "claude-sonnet-4.6",
-    gemini: "provider-default",
+    gemini: "auto-gemini-3",
     grok: "grok-build",
     codex: "gpt-5.5"
   });
@@ -914,7 +926,7 @@
     { id: "sa-1", name: "Research Agent", role: "Codebase search & symbols", model: "grok", specificModel: "grok-build", active: false, cost: "$0.02" },
     { id: "sa-2b", name: "Backend Coder Agent", role: "Rust / API / backend services", model: "codex", specificModel: "gpt-5.3-codex", active: false, cost: "$0.03" },
     { id: "sa-2f", name: "Frontend Coder Agent", role: "Svelte / TS / styling design", model: "claude", specificModel: "claude-sonnet-4.6", active: false, cost: "$0.03" },
-    { id: "sa-3", name: "Verification Agent", role: "Cargo check / test execution", model: "gemini", specificModel: "provider-default", active: false, cost: "$0.01" }
+    { id: "sa-3", name: "Verification Agent", role: "Cargo check / test execution", model: "gemini", specificModel: "auto-gemini-3", active: false, cost: "$0.01" }
   ]);
 
   function isKnownProvider(provider: string): boolean {
@@ -936,6 +948,8 @@
   }
 
   function formatSpecificModelLabel(specificModel: string): string {
+    if (specificModel === "auto-gemini-3") return "Auto (Gemini 3)";
+    if (specificModel === "auto-gemini-2.5") return "Auto (Gemini 2.5)";
     return specificModel === "provider-default" ? "Provider default / auto" : specificModel;
   }
 
